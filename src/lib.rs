@@ -9,8 +9,10 @@
 //! - [`proto`] — wire protocol shared by client and relay
 //! - [`relay`] — the zero-knowledge sync server (`sshvault serve`)
 //! - [`sync`] — client sync: enroll, push, pull (`sshvault sync`)
+//! - [`device`] — device lifecycle: enroll, approve, revoke, recover
 
 pub mod crypto;
+pub mod device;
 pub mod merge;
 pub mod proto;
 pub mod record;

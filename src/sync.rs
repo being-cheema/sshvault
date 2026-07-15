@@ -3,14 +3,14 @@
 //! against the enrolled public key. The vault key never leaves the machine —
 //! only sealed blobs cross the wire.
 
-use crate::proto::{EnrollReq, PullResp, PushReq, PushResp, Signed, WireEntry};
+use crate::proto::{EnrollReq, EnrollResp, PullResp, PushReq, PushResp, Signed, WireEntry};
 use crate::vault::{Vault, VaultError};
 use base64::Engine;
 use ed25519_dalek::Signer;
 use std::collections::HashSet;
 
 type B64 = base64::engine::general_purpose::GeneralPurpose;
-const B64: B64 = base64::engine::general_purpose::STANDARD;
+pub(crate) const B64: B64 = base64::engine::general_purpose::STANDARD;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -25,7 +25,7 @@ pub enum SyncError {
 }
 
 /// Sign `body` with the device key and wrap it in a [`Signed`] envelope.
-fn sign(v: &Vault, body: String) -> Signed {
+pub(crate) fn sign(v: &Vault, body: String) -> Signed {
     let sig = v.signing_key().sign(body.as_bytes());
     Signed {
         vault_id_b64: B64.encode(v.vault_id().as_bytes()),
@@ -35,7 +35,7 @@ fn sign(v: &Vault, body: String) -> Signed {
     }
 }
 
-async fn post<T: serde::de::DeserializeOwned>(
+pub(crate) async fn post<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: String,
     signed: &Signed,
@@ -44,7 +44,9 @@ async fn post<T: serde::de::DeserializeOwned>(
     parse(resp).await
 }
 
-async fn parse<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T, SyncError> {
+pub(crate) async fn parse<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, SyncError> {
     let status = resp.status();
     if !status.is_success() {
         return Err(SyncError::Rejected {
@@ -55,17 +57,19 @@ async fn parse<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Resul
     Ok(resp.json().await?)
 }
 
-/// Register this device with the relay (TOFU in v0.1; Phase 4 adds approval).
-pub async fn enroll(v: &Vault, relay: &str) -> Result<(), SyncError> {
+/// Register this device with the relay. Returns whether it is already approved
+/// (true only for the device that bootstrapped the vault).
+pub async fn enroll(v: &Vault, relay: &str) -> Result<bool, SyncError> {
     let client = reqwest::Client::new();
     let req = EnrollReq {
         device_name: v.meta.device_name.clone(),
         ed25519_pub_b64: B64.encode(v.ed25519_pub()),
         x25519_pub_b64: v.meta.x25519_pub_b64.clone(),
+        recovery_pub_b64: v.meta.recovery_pub_b64.clone(),
     };
     let signed = sign(v, serde_json::to_string(&req).expect("enroll serializes"));
-    let _: PushResp = post(&client, format!("{relay}/v1/enroll"), &signed).await?;
-    Ok(())
+    let resp: EnrollResp = post(&client, format!("{relay}/v1/enroll"), &signed).await?;
+    Ok(resp.approved)
 }
 
 /// One full sync round: push everything the relay lacks, then pull everything we
@@ -126,12 +130,12 @@ fn decode16(b64: &str) -> Result<[u8; 16], SyncError> {
         .ok_or_else(|| bad("entry_id"))
 }
 
-fn bad(what: &str) -> SyncError {
+pub(crate) fn bad(what: &str) -> SyncError {
     SyncError::Vault(VaultError::Corrupt(format!("relay sent malformed {what}")))
 }
 
 /// Minimal percent-encoding for base64 in a query string (`+ / =`).
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     s.replace('+', "%2B")
         .replace('/', "%2F")
         .replace('=', "%3D")

@@ -137,13 +137,35 @@ impl Vault {
         vault_key: &Secret32,
         recovery_pub: &[u8; 32],
     ) -> Result<Vault, VaultError> {
+        Self::create_with_keys(
+            dir,
+            device_name,
+            passphrase,
+            vault_id,
+            vault_key,
+            recovery_pub,
+            crypto::new_device_keys(),
+        )
+    }
+
+    /// Like [`Vault::create`] but with caller-supplied device keys — used by
+    /// recovery, where the device's Ed25519 key must be known (to prove phrase
+    /// ownership to the relay) before the vault_id is learned.
+    pub fn create_with_keys(
+        dir: &Path,
+        device_name: &str,
+        passphrase: &str,
+        vault_id: Uuid,
+        vault_key: &Secret32,
+        recovery_pub: &[u8; 32],
+        device: crypto::DeviceKeys,
+    ) -> Result<Vault, VaultError> {
         if dir.join(META).exists() {
             return Err(VaultError::AlreadyExists(dir.to_path_buf()));
         }
         fs::create_dir_all(dir)?;
         restrict_permissions(dir)?;
 
-        let device = crypto::new_device_keys();
         let kdf = KdfParams {
             salt_b64: b64(&crypto::random_bytes::<16>()),
             m_kib: crypto::ARGON2_M_KIB,
@@ -216,6 +238,26 @@ impl Vault {
     /// This device's X25519 static secret (receives wrapped vault keys).
     pub fn x25519_secret(&self) -> x25519_dalek::StaticSecret {
         x25519_dalek::StaticSecret::from(self.keyring.x25519_secret)
+    }
+
+    /// Install the real vault key on a device that joined with a provisional one
+    /// (enrollment / recovery). Safe only while the log is empty — nothing has
+    /// been sealed under the old key yet — which is the case before a device is
+    /// approved and first syncs.
+    pub fn set_vault_key(
+        &mut self,
+        vault_key: &Secret32,
+        passphrase: &str,
+    ) -> Result<(), VaultError> {
+        if !self.raw_entries()?.is_empty() {
+            return Err(VaultError::Corrupt(
+                "refusing to swap vault key on a non-empty log".into(),
+            ));
+        }
+        self.keyring.vault_key = **vault_key;
+        self.write_keyring(passphrase)?;
+        self.state.clear();
+        Ok(())
     }
 
     // ---- CRUD --------------------------------------------------------------

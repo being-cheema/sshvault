@@ -39,10 +39,10 @@ pub struct PullResp {
     pub head: u64,
 }
 
-/// `POST /v1/enroll` body: register a device's public keys for a vault. In v0.1
-/// enrollment is trust-on-first-use per vault (Phase 4 adds approval + the
-/// wrapped-key handshake); the relay only stores these to authenticate later
-/// requests and to let existing devices discover who to wrap the vault key for.
+/// `POST /v1/enroll` body: register a device's public keys for a vault. The
+/// first device to enroll a vault bootstraps it (auto-approved, and its
+/// `recovery_pub` is recorded for recovery); every later device starts pending
+/// until an approved device approves it and wraps the vault key for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollReq {
     pub device_name: String,
@@ -50,6 +50,78 @@ pub struct EnrollReq {
     pub ed25519_pub_b64: String,
     /// X25519 public key, base64 — recipient for a wrapped vault key.
     pub x25519_pub_b64: String,
+    /// Recovery Ed25519 public key, base64. Honored only when bootstrapping the
+    /// vault (first enroll); ignored for later devices.
+    pub recovery_pub_b64: String,
+}
+
+/// `POST /v1/enroll` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrollResp {
+    /// True if this device may already sync (it bootstrapped the vault).
+    pub approved: bool,
+    pub head: u64,
+}
+
+/// `POST /v1/approve` body (signed by an approved device): admit `target_pub`
+/// and hand it the vault key wrapped for its X25519 public key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApproveReq {
+    /// Ed25519 pub (base64) of the device being approved.
+    pub target_pub_b64: String,
+    /// Vault key wrapped for the target (base64). The relay stores it opaquely.
+    pub wrapped_key_b64: String,
+}
+
+/// `POST /v1/revoke` body (signed by an approved device).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeReq {
+    /// Ed25519 pub (base64) of the device to revoke.
+    pub target_pub_b64: String,
+}
+
+/// One device as seen by `GET /v1/devices`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub ed25519_pub_b64: String,
+    pub x25519_pub_b64: String,
+    pub approved: bool,
+    pub revoked: bool,
+}
+
+/// `GET /v1/devices` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicesResp {
+    pub devices: Vec<DeviceInfo>,
+}
+
+/// `GET /v1/wrapped` response: a pending device polls for its wrapped vault key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrappedResp {
+    pub approved: bool,
+    /// The vault key wrapped for this device (base64), once an approver set it.
+    pub wrapped_key_b64: Option<String>,
+}
+
+/// `POST /v1/recover` body: prove ownership of the recovery key to re-admit a
+/// fresh device with only the recovery phrase. Not a [`Signed`] envelope — the
+/// device isn't enrolled yet; it authenticates with `sig` over its new Ed25519
+/// public key, made by the recovery key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverReq {
+    pub recovery_pub_b64: String,
+    pub device_name: String,
+    pub ed25519_pub_b64: String,
+    pub x25519_pub_b64: String,
+    /// Recovery-key signature over the new device's Ed25519 public key bytes.
+    pub sig_b64: String,
+}
+
+/// `POST /v1/recover` response: which vault the recovery key unlocked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverResp {
+    pub vault_id_b64: String,
 }
 
 /// Authenticated envelope: `body` is the JSON of one of the request types above,

@@ -5,13 +5,23 @@
 //! compromise leaks only blob sizes, timestamps, and which device pushed what.
 //!
 //! Storage (SQLite via sqlx):
-//! - `devices(vault_id, ed25519_pub, x25519_pub, name, revoked)`  — who may sync
-//! - `entries(vault_id, seq, entry_id, blob)`                      — the opaque log
+//! - `vaults(vault_id, recovery_pub)`                             — bootstrap + recovery
+//! - `devices(vault_id, ed25519_pub, x25519_pub, name, approved, revoked, wrapped_key)`
+//! - `entries(vault_id, seq, entry_id, blob)`                     — the opaque log
 //!
 //! `seq` is a per-relay monotonic cursor; clients pull everything with
 //! `seq > their_cursor`. Convergence is the client's merge engine's job.
+//!
+//! Device lifecycle: the first device to enroll a vault bootstraps it and is
+//! auto-approved; later devices are pending until an approved device approves
+//! them (handing over the vault key wrapped for their X25519 key). Only
+//! approved, non-revoked devices may push/pull. Revocation is sticky — a
+//! revoked device cannot re-enroll its way back in.
 
-use crate::proto::{EnrollReq, PullResp, PushReq, PushResp, Signed, WireEntry};
+use crate::proto::{
+    ApproveReq, DeviceInfo, DevicesResp, EnrollReq, EnrollResp, PullResp, PushReq, PushResp,
+    RecoverReq, RecoverResp, RevokeReq, Signed, WireEntry, WrappedResp,
+};
 use axum::{
     extract::{ws::WebSocketUpgrade, Query, State},
     http::StatusCode,
@@ -50,6 +60,11 @@ pub async fn serve(addr: &str, db_path: &str) -> anyhow::Result<()> {
     };
     let app = Router::new()
         .route("/v1/enroll", post(enroll))
+        .route("/v1/approve", post(approve))
+        .route("/v1/revoke", post(revoke))
+        .route("/v1/devices", get(devices))
+        .route("/v1/wrapped", get(wrapped))
+        .route("/v1/recover", post(recover))
         .route("/v1/push", post(push))
         .route("/v1/pull", get(pull))
         .route("/v1/ws", get(ws))
@@ -63,12 +78,22 @@ pub async fn serve(addr: &str, db_path: &str) -> anyhow::Result<()> {
 
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS vaults (
+            vault_id      TEXT PRIMARY KEY,
+            recovery_pub  BLOB NOT NULL
+        )",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS devices (
             vault_id     TEXT NOT NULL,
             ed25519_pub  BLOB NOT NULL,
             x25519_pub   BLOB NOT NULL,
             name         TEXT NOT NULL,
+            approved     INTEGER NOT NULL DEFAULT 0,
             revoked      INTEGER NOT NULL DEFAULT 0,
+            wrapped_key  BLOB,
             PRIMARY KEY (vault_id, ed25519_pub)
         )",
     )
@@ -113,16 +138,36 @@ fn verify(signed: &Signed) -> Result<(String, VerifyingKey), (StatusCode, String
     Ok((signed.vault_id_b64.clone(), key))
 }
 
-async fn is_enrolled(db: &SqlitePool, vault: &str, pubk: &VerifyingKey) -> bool {
-    sqlx::query("SELECT revoked FROM devices WHERE vault_id = ? AND ed25519_pub = ?")
-        .bind(vault)
-        .bind(pubk.as_bytes().as_slice())
-        .fetch_optional(db)
+/// A device may sync only if it is enrolled, approved, and not revoked.
+async fn can_sync(db: &SqlitePool, vault: &str, pubk: &VerifyingKey) -> bool {
+    device_row(db, vault, pubk)
         .await
-        .ok()
-        .flatten()
-        .map(|row| row.get::<i64, _>("revoked") == 0)
+        .map(|(approved, revoked, _)| approved && !revoked)
         .unwrap_or(false)
+}
+
+/// Fetch `(approved, revoked, x25519_pub)` for a device, if it exists.
+async fn device_row(
+    db: &SqlitePool,
+    vault: &str,
+    pubk: &VerifyingKey,
+) -> Option<(bool, bool, Vec<u8>)> {
+    sqlx::query(
+        "SELECT approved, revoked, x25519_pub FROM devices WHERE vault_id = ? AND ed25519_pub = ?",
+    )
+    .bind(vault)
+    .bind(pubk.as_bytes().as_slice())
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|row| {
+        (
+            row.get::<i64, _>("approved") != 0,
+            row.get::<i64, _>("revoked") != 0,
+            row.get::<Vec<u8>, _>("x25519_pub"),
+        )
+    })
 }
 
 fn json_body<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, (StatusCode, String)> {
@@ -131,35 +176,253 @@ fn json_body<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, (StatusCod
 
 // ---- handlers ---------------------------------------------------------------
 
-/// Register a device for a vault (TOFU in v0.1). The signature proves the caller
-/// holds the private key for the pubkey it is registering.
+/// Register a device for a vault. The signature proves the caller holds the
+/// private key for the pubkey it is registering. The first device to enroll a
+/// vault bootstraps it (auto-approved, recovery key recorded); later devices
+/// enroll as pending. Revocation is sticky: a revoked device stays out.
 async fn enroll(
     State(st): State<AppState>,
     Json(signed): Json<Signed>,
-) -> Result<Json<PushResp>, (StatusCode, String)> {
+) -> Result<Json<EnrollResp>, (StatusCode, String)> {
     let (vault, key) = verify(&signed)?;
     let req: EnrollReq = json_body(&signed.body)?;
     // the signing key must be the key being enrolled — no enrolling on behalf of others
     if req.ed25519_pub_b64 != signed.device_pub_b64 {
         return Err((StatusCode::BAD_REQUEST, "enroll must be self-signed".into()));
     }
+    // a device that was revoked cannot re-enroll its way back in
+    if let Some((_, revoked, _)) = device_row(&st.db, &vault, &key).await {
+        if revoked {
+            return Err((StatusCode::FORBIDDEN, "device is revoked".into()));
+        }
+    }
     let x_pub = B64
         .decode(&req.x25519_pub_b64)
         .map_err(|_| (StatusCode::BAD_REQUEST, "x25519_pub".to_string()))?;
+
+    // First device for this vault bootstraps it and is auto-approved.
+    let bootstrap =
+        sqlx::query("INSERT OR IGNORE INTO vaults (vault_id, recovery_pub) VALUES (?, ?)")
+            .bind(&vault)
+            .bind(
+                B64.decode(&req.recovery_pub_b64)
+                    .map_err(|_| (StatusCode::BAD_REQUEST, "recovery_pub".to_string()))?,
+            )
+            .execute(&st.db)
+            .await
+            .map_err(db_err)?
+            .rows_affected()
+            > 0;
+    let approved = if bootstrap { 1 } else { 0 };
+
     sqlx::query(
-        "INSERT INTO devices (vault_id, ed25519_pub, x25519_pub, name, revoked)
-         VALUES (?, ?, ?, ?, 0)
-         ON CONFLICT (vault_id, ed25519_pub) DO UPDATE SET revoked = 0, name = excluded.name",
+        "INSERT INTO devices (vault_id, ed25519_pub, x25519_pub, name, approved, revoked)
+         VALUES (?, ?, ?, ?, ?, 0)
+         ON CONFLICT (vault_id, ed25519_pub)
+         DO UPDATE SET name = excluded.name, x25519_pub = excluded.x25519_pub",
     )
     .bind(&vault)
     .bind(key.as_bytes().as_slice())
     .bind(x_pub)
     .bind(&req.device_name)
+    .bind(approved)
     .execute(&st.db)
     .await
     .map_err(db_err)?;
     let head = head(&st.db, &vault).await.map_err(db_err)?;
+    Ok(Json(EnrollResp {
+        approved: approved == 1,
+        head,
+    }))
+}
+
+/// Approve a pending device and store the vault key wrapped for it. Signed by an
+/// already-approved device; the relay never sees the unwrapped key.
+async fn approve(
+    State(st): State<AppState>,
+    Json(signed): Json<Signed>,
+) -> Result<Json<PushResp>, (StatusCode, String)> {
+    let (vault, key) = verify(&signed)?;
+    if !can_sync(&st.db, &vault, &key).await {
+        return Err((StatusCode::FORBIDDEN, "approver not approved".into()));
+    }
+    let req: ApproveReq = json_body(&signed.body)?;
+    let target = B64
+        .decode(&req.target_pub_b64)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "target_pub".to_string()))?;
+    let wrapped = B64
+        .decode(&req.wrapped_key_b64)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "wrapped_key".to_string()))?;
+    let res = sqlx::query(
+        "UPDATE devices SET approved = 1, wrapped_key = ?
+         WHERE vault_id = ? AND ed25519_pub = ? AND revoked = 0",
+    )
+    .bind(wrapped)
+    .bind(&vault)
+    .bind(&target)
+    .execute(&st.db)
+    .await
+    .map_err(db_err)?;
+    if res.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "no such pending device".into()));
+    }
+    let head = head(&st.db, &vault).await.map_err(db_err)?;
     Ok(Json(PushResp { head, stored: 0 }))
+}
+
+/// Revoke a device: it can no longer sync and cannot re-enroll. Signed by an
+/// approved device. Clearing its wrapped key removes the ciphertext copy.
+async fn revoke(
+    State(st): State<AppState>,
+    Json(signed): Json<Signed>,
+) -> Result<Json<PushResp>, (StatusCode, String)> {
+    let (vault, key) = verify(&signed)?;
+    if !can_sync(&st.db, &vault, &key).await {
+        return Err((StatusCode::FORBIDDEN, "revoker not approved".into()));
+    }
+    let req: RevokeReq = json_body(&signed.body)?;
+    let target = B64
+        .decode(&req.target_pub_b64)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "target_pub".to_string()))?;
+    let res = sqlx::query(
+        "UPDATE devices SET revoked = 1, approved = 0, wrapped_key = NULL
+         WHERE vault_id = ? AND ed25519_pub = ?",
+    )
+    .bind(&vault)
+    .bind(&target)
+    .execute(&st.db)
+    .await
+    .map_err(db_err)?;
+    if res.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "no such device".into()));
+    }
+    let head = head(&st.db, &vault).await.map_err(db_err)?;
+    Ok(Json(PushResp { head, stored: 0 }))
+}
+
+/// List devices for a vault (signed GET, any approved device). Lets an approver
+/// see pending devices to approve and their X25519 keys to wrap for.
+async fn devices(
+    State(st): State<AppState>,
+    Query(q): Query<SignedQuery>,
+) -> Result<Json<DevicesResp>, (StatusCode, String)> {
+    let signed = q.into_signed("devices");
+    let (vault, key) = verify(&signed)?;
+    if !can_sync(&st.db, &vault, &key).await {
+        return Err((StatusCode::FORBIDDEN, "device not approved".into()));
+    }
+    let rows = sqlx::query(
+        "SELECT name, ed25519_pub, x25519_pub, approved, revoked FROM devices WHERE vault_id = ?",
+    )
+    .bind(&vault)
+    .fetch_all(&st.db)
+    .await
+    .map_err(db_err)?;
+    let devices = rows
+        .into_iter()
+        .map(|row| DeviceInfo {
+            name: row.get::<String, _>("name"),
+            ed25519_pub_b64: B64.encode(row.get::<Vec<u8>, _>("ed25519_pub")),
+            x25519_pub_b64: B64.encode(row.get::<Vec<u8>, _>("x25519_pub")),
+            approved: row.get::<i64, _>("approved") != 0,
+            revoked: row.get::<i64, _>("revoked") != 0,
+        })
+        .collect();
+    Ok(Json(DevicesResp { devices }))
+}
+
+/// A pending device polls here for its wrapped vault key (signed GET).
+async fn wrapped(
+    State(st): State<AppState>,
+    Query(q): Query<SignedQuery>,
+) -> Result<Json<WrappedResp>, (StatusCode, String)> {
+    let signed = q.into_signed("wrapped");
+    let (vault, key) = verify(&signed)?;
+    let row = sqlx::query(
+        "SELECT approved, revoked, wrapped_key FROM devices WHERE vault_id = ? AND ed25519_pub = ?",
+    )
+    .bind(&vault)
+    .bind(key.as_bytes().as_slice())
+    .fetch_optional(&st.db)
+    .await
+    .map_err(db_err)?
+    .ok_or((StatusCode::NOT_FOUND, "device not enrolled".to_string()))?;
+    if row.get::<i64, _>("revoked") != 0 {
+        return Err((StatusCode::FORBIDDEN, "device is revoked".into()));
+    }
+    Ok(Json(WrappedResp {
+        approved: row.get::<i64, _>("approved") != 0,
+        wrapped_key_b64: row
+            .get::<Option<Vec<u8>>, _>("wrapped_key")
+            .map(|b| B64.encode(b)),
+    }))
+}
+
+/// Recover on a fresh machine using only the recovery phrase. The caller proves
+/// it holds the recovery private key by signing its new device's Ed25519 public
+/// key; the relay looks up the vault by recovery public key and admits the new
+/// device as approved. The wrapped-key handshake is unnecessary — the recovery
+/// phrase re-derives the vault key locally.
+async fn recover(
+    State(st): State<AppState>,
+    Json(req): Json<RecoverReq>,
+) -> Result<Json<RecoverResp>, (StatusCode, String)> {
+    let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string());
+    let recovery_pub: [u8; 32] = B64
+        .decode(&req.recovery_pub_b64)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| bad("recovery_pub"))?;
+    let ed_pub_bytes: [u8; 32] = B64
+        .decode(&req.ed25519_pub_b64)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| bad("ed25519_pub"))?;
+    let sig_bytes: [u8; 64] = B64
+        .decode(&req.sig_b64)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| bad("sig"))?;
+    // the recovery key must sign the new device key — proves phrase ownership
+    let rkey = VerifyingKey::from_bytes(&recovery_pub).map_err(|_| bad("recovery_pub"))?;
+    rkey.verify(&ed_pub_bytes, &Signature::from_bytes(&sig_bytes))
+        .map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "recovery signature invalid".into(),
+            )
+        })?;
+
+    // find the vault this recovery key bootstrapped
+    let vrow = sqlx::query("SELECT vault_id FROM vaults WHERE recovery_pub = ?")
+        .bind(recovery_pub.as_slice())
+        .fetch_optional(&st.db)
+        .await
+        .map_err(db_err)?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "no vault for this phrase".to_string(),
+        ))?;
+    let vault: String = vrow.get::<String, _>("vault_id");
+    let x_pub = B64
+        .decode(&req.x25519_pub_b64)
+        .map_err(|_| bad("x25519_pub"))?;
+    sqlx::query(
+        "INSERT INTO devices (vault_id, ed25519_pub, x25519_pub, name, approved, revoked)
+         VALUES (?, ?, ?, ?, 1, 0)
+         ON CONFLICT (vault_id, ed25519_pub)
+         DO UPDATE SET approved = 1, revoked = 0, x25519_pub = excluded.x25519_pub",
+    )
+    .bind(&vault)
+    .bind(ed_pub_bytes.as_slice())
+    .bind(x_pub)
+    .bind(&req.device_name)
+    .execute(&st.db)
+    .await
+    .map_err(db_err)?;
+    Ok(Json(RecoverResp {
+        vault_id_b64: vault,
+    }))
 }
 
 async fn push(
@@ -167,7 +430,7 @@ async fn push(
     Json(signed): Json<Signed>,
 ) -> Result<Json<PushResp>, (StatusCode, String)> {
     let (vault, key) = verify(&signed)?;
-    if !is_enrolled(&st.db, &vault, &key).await {
+    if !can_sync(&st.db, &vault, &key).await {
         return Err((
             StatusCode::FORBIDDEN,
             "device not enrolled or revoked".into(),
@@ -211,6 +474,27 @@ struct PullQuery {
     since: u64,
 }
 
+/// A signed GET whose body is `"<action>:<vault_b64>"` — used for endpoints that
+/// carry no request body of their own (devices, wrapped).
+#[derive(Deserialize)]
+struct SignedQuery {
+    vault: String,
+    device: String,
+    sig: String,
+}
+
+impl SignedQuery {
+    fn into_signed(self, action: &str) -> Signed {
+        let body = format!("{action}:{}", self.vault);
+        Signed {
+            vault_id_b64: self.vault,
+            device_pub_b64: self.device,
+            sig_b64: self.sig,
+            body,
+        }
+    }
+}
+
 /// Pull is a GET, so we sign the string `pull:<since>` instead of a JSON body.
 async fn pull(
     State(st): State<AppState>,
@@ -223,7 +507,7 @@ async fn pull(
         body: format!("pull:{}", q.since),
     };
     let (vault, key) = verify(&signed)?;
-    if !is_enrolled(&st.db, &vault, &key).await {
+    if !can_sync(&st.db, &vault, &key).await {
         return Err((
             StatusCode::FORBIDDEN,
             "device not enrolled or revoked".into(),

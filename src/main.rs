@@ -65,6 +65,42 @@ enum Cmd {
         #[arg(long, default_value = "sshvault-relay.db")]
         db: String,
     },
+    /// Manage devices enrolled in your vault
+    Device {
+        #[command(subcommand)]
+        cmd: DeviceCmd,
+    },
+    /// Recover a vault on this machine from your 24-word recovery phrase
+    Recover {
+        /// Relay URL the vault syncs with
+        #[arg(long)]
+        relay: String,
+        /// Human-readable name for this device
+        #[arg(long, default_value_t = hostname())]
+        device_name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceCmd {
+    /// Enroll THIS machine into an existing vault and wait for approval
+    Enroll {
+        /// Vault id to join (shown by `sshvault device list` on an enrolled device)
+        #[arg(long)]
+        vault: String,
+        /// Relay URL the vault syncs with
+        #[arg(long)]
+        relay: String,
+        /// Human-readable name for this device
+        #[arg(long, default_value_t = hostname())]
+        device_name: String,
+    },
+    /// Approve a pending device by its short code
+    Approve { code: String },
+    /// List devices enrolled in your vault
+    List,
+    /// Revoke a device by its short code (it can no longer sync or re-enroll)
+    Revoke { code: String },
 }
 
 #[derive(Subcommand)]
@@ -199,6 +235,8 @@ fn run() -> Result<()> {
         Cmd::Import { file } => import(&file),
         Cmd::Sync { relay } => sync(relay),
         Cmd::Serve { addr, db } => serve(&addr, &db),
+        Cmd::Device { cmd } => device_cmd(cmd),
+        Cmd::Recover { relay, device_name } => recover(&relay, &device_name),
     }
 }
 
@@ -469,6 +507,102 @@ fn serve(addr: &str, db: &str) -> Result<()> {
         .init();
     let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
     rt.block_on(sshvault::relay::serve(addr, db))
+}
+
+fn device_cmd(cmd: DeviceCmd) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
+    match cmd {
+        DeviceCmd::Enroll {
+            vault,
+            relay,
+            device_name,
+        } => {
+            let vault_id = uuid::Uuid::parse_str(vault.trim())
+                .context("invalid vault id — copy it from `sshvault device list`")?;
+            let relay = relay.trim_end_matches('/').to_string();
+            let dir = sshvault::device::default_dir();
+            let pass = prompt_new_passphrase()?;
+            rt.block_on(async {
+                println!("enrolling this device — waiting for approval...");
+                sshvault::device::enroll_and_wait(
+                    &dir,
+                    &device_name,
+                    &pass,
+                    vault_id,
+                    &relay,
+                    |code| {
+                        println!("\nOn an already-enrolled device, run:");
+                        println!("    sshvault device approve {code}\n");
+                        println!("(code for THIS device: {code})");
+                    },
+                )
+                .await
+            })?;
+            println!("approved — vault key installed. Run `sshvault sync` to pull your data.");
+            Ok(())
+        }
+        DeviceCmd::Approve { code } => {
+            let v = open_vault()?;
+            let relay = require_relay(&v)?;
+            let name = rt.block_on(sshvault::device::approve(&v, &relay, &code))?;
+            println!("approved '{name}' ({code}) — it can now sync.");
+            Ok(())
+        }
+        DeviceCmd::List => {
+            let v = open_vault()?;
+            let relay = require_relay(&v)?;
+            let devices = rt.block_on(sshvault::device::list_devices(&v, &relay))?;
+            println!("vault: {}", v.vault_id());
+            for d in devices {
+                let code = sshvault::device::short_code(&d.ed25519_pub_b64);
+                let status = if d.revoked {
+                    "revoked"
+                } else if d.approved {
+                    "approved"
+                } else {
+                    "pending"
+                };
+                println!("  {code}  {:<10}  {}", status, d.name);
+            }
+            Ok(())
+        }
+        DeviceCmd::Revoke { code } => {
+            let v = open_vault()?;
+            let relay = require_relay(&v)?;
+            let name = rt.block_on(sshvault::device::revoke(&v, &relay, &code))?;
+            println!("revoked '{name}' ({code}) — it can no longer sync or re-enroll.");
+            Ok(())
+        }
+    }
+}
+
+fn recover(relay: &str, device_name: &str) -> Result<()> {
+    let dir = sshvault::device::default_dir();
+    let relay = relay.trim_end_matches('/').to_string();
+    let phrase = rpassword::prompt_password("Enter your 24-word recovery phrase: ")
+        .context("failed to read recovery phrase")?;
+    let pass = prompt_new_passphrase()?;
+    let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
+    let mut v = rt.block_on(sshvault::device::recover(
+        &dir,
+        device_name,
+        &pass,
+        phrase.trim(),
+        &relay,
+    ))?;
+    let (_, pulled) = rt.block_on(sshvault::sync::sync_once(&mut v))?;
+    println!(
+        "recovered vault {} — pulled {pulled} records.",
+        v.vault_id()
+    );
+    println!("run `sshvault apply` to write your ssh config.");
+    Ok(())
+}
+
+fn require_relay(v: &Vault) -> Result<String> {
+    v.relay_url()
+        .map(|s| s.to_string())
+        .context("no relay configured — run `sshvault sync --relay <url>` first")
 }
 
 fn open_vault() -> Result<Vault> {

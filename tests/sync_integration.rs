@@ -2,44 +2,18 @@
 //! must converge to identical state after syncing through a real in-process
 //! relay — and the relay's storage must contain zero plaintext.
 
-use sshvault::record::{Host, Kind};
+use sshvault::record::Kind;
 use sshvault::vault::Vault;
 use std::path::Path;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-/// Boot the relay on an ephemeral port; return its base URL and the db path.
-async fn start_relay(db_path: String) -> String {
-    // bind :0 to get a free port, then hand the listener to axum via serve()
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener); // serve() rebinds; race window is negligible for a test
-    let db = db_path.clone();
-    tokio::spawn(async move {
-        sshvault::relay::serve(&addr.to_string(), &db)
-            .await
-            .unwrap();
-    });
-    // wait for /healthz to answer
-    let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
-    for _ in 0..100 {
-        if client
-            .get(format!("{base}/healthz"))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-        {
-            return base;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("relay did not come up");
-}
+mod common;
+use common::{drain, host, hosts_sorted, start_relay};
 
 /// Create N devices that all share one vault_id + vault_key (as enrollment would
-/// produce), each in its own dir, all pointed at `relay` and enrolled.
+/// produce), each in its own dir, all pointed at `relay`. Device 0 bootstraps the
+/// vault and approves every later device, so all N may sync.
 async fn make_devices(root: &Path, n: usize, relay: &str) -> Vec<Vault> {
     let vault_id = Uuid::new_v4();
     let vault_key = sshvault::crypto::Secret32::new(sshvault::crypto::random_bytes::<32>());
@@ -57,39 +31,18 @@ async fn make_devices(root: &Path, n: usize, relay: &str) -> Vec<Vault> {
         )
         .unwrap();
         v.set_relay_url(relay).unwrap();
-        sshvault::sync::enroll(&v, relay).await.unwrap();
+        let approved = sshvault::sync::enroll(&v, relay).await.unwrap();
+        assert_eq!(approved, i == 0, "only the bootstrapper is auto-approved");
         devices.push(v);
     }
+    // dev0 approves every pending device so they can sync.
+    for i in 1..n {
+        let code = sshvault::device::short_code(&devices[i].meta.ed25519_pub_b64);
+        sshvault::device::approve(&devices[0], relay, &code)
+            .await
+            .unwrap();
+    }
     devices
-}
-
-fn host(alias: &str, hostname: &str, port: u16) -> Host {
-    Host {
-        alias: alias.into(),
-        hostname: Some(hostname.into()),
-        port: Some(port),
-        ..Default::default()
-    }
-}
-
-/// Sync a device until a full round makes no local progress (push+pull settle).
-async fn drain(v: &mut Vault) {
-    for _ in 0..10 {
-        let (pushed, pulled) = sshvault::sync::sync_once(v).await.unwrap();
-        if pushed == 0 && pulled == 0 {
-            return;
-        }
-    }
-}
-
-fn hosts_sorted(v: &Vault) -> Vec<Host> {
-    let mut h: Vec<Host> = v
-        .list::<Host>(Kind::Host)
-        .into_iter()
-        .map(|(_, h)| h)
-        .collect();
-    h.sort_by(|a, b| a.alias.cmp(&b.alias));
-    h
 }
 
 #[tokio::test]
