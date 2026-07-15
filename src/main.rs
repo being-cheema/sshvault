@@ -1,0 +1,470 @@
+//! sshvault CLI. Thin dispatch layer: all logic lives in the library modules.
+
+use anyhow::{bail, Context, Result};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use sshvault::record::{ForwardKind, Host, Kind, PortForward, Snippet};
+use sshvault::sshconfig;
+use sshvault::vault::{self, Vault};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "sshvault", version, about = "End-to-end-encrypted sync for your SSH workflow", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Create a new vault (prints your recovery phrase — store it safely!)
+    Init {
+        /// Human-readable name for this device
+        #[arg(long, default_value_t = hostname())]
+        device_name: String,
+    },
+    /// Manage SSH hosts
+    Host {
+        #[command(subcommand)]
+        cmd: HostCmd,
+    },
+    /// Manage reusable command snippets
+    Snippet {
+        #[command(subcommand)]
+        cmd: SnippetCmd,
+    },
+    /// Manage port-forward definitions
+    Fwd {
+        #[command(subcommand)]
+        cmd: FwdCmd,
+    },
+    /// Regenerate ~/.ssh/sshvault.conf and ensure your config Includes it
+    Apply {
+        /// Target .ssh directory (defaults to ~/.ssh)
+        #[arg(long)]
+        ssh_dir: Option<PathBuf>,
+    },
+    /// Export the vault as plaintext JSON to stdout (you own your data)
+    Export,
+    /// Import a JSON export (skips entries whose name already exists)
+    Import {
+        /// Path to a JSON file produced by `sshvault export` ("-" for stdin)
+        file: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum HostCmd {
+    /// Add a host
+    Add {
+        alias: String,
+        #[command(flatten)]
+        opts: HostOpts,
+    },
+    /// Edit a host (only the flags you pass change)
+    Edit {
+        alias: String,
+        #[command(flatten)]
+        opts: HostOpts,
+    },
+    /// Remove a host
+    Rm { alias: String },
+    /// List hosts
+    List,
+}
+
+#[derive(Args, Default)]
+struct HostOpts {
+    /// Real hostname or IP (ssh HostName)
+    #[arg(long)]
+    hostname: Option<String>,
+    #[arg(long)]
+    port: Option<u16>,
+    #[arg(long)]
+    user: Option<String>,
+    /// ProxyJump host
+    #[arg(long)]
+    jump: Option<String>,
+    /// IdentityFile path
+    #[arg(long)]
+    identity: Option<String>,
+    /// Tag (repeatable); on edit, replaces all tags
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum SnippetCmd {
+    /// Add a snippet
+    Add {
+        name: String,
+        /// The shell command (quote it)
+        command: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Edit a snippet (only the flags you pass change)
+    Edit {
+        name: String,
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Remove a snippet
+    Rm { name: String },
+    /// List snippets
+    List,
+    /// Run a snippet through your shell
+    Run { name: String },
+}
+
+#[derive(Subcommand)]
+enum FwdCmd {
+    /// Add a port-forward
+    Add {
+        name: String,
+        /// local: `port:host:port` · remote: `port:host:port` · dynamic: `port`
+        spec: String,
+        /// Host alias this forward belongs to
+        #[arg(long)]
+        host: String,
+        #[arg(long = "type", value_enum, default_value = "local")]
+        kind: FwdType,
+    },
+    /// Remove a port-forward
+    Rm { name: String },
+    /// List port-forwards
+    List,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum FwdType {
+    Local,
+    Remote,
+    Dynamic,
+}
+
+impl From<FwdType> for ForwardKind {
+    fn from(t: FwdType) -> Self {
+        match t {
+            FwdType::Local => ForwardKind::Local,
+            FwdType::Remote => ForwardKind::Remote,
+            FwdType::Dynamic => ForwardKind::Dynamic,
+        }
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Init { device_name } => init(&device_name),
+        Cmd::Host { cmd } => host_cmd(cmd),
+        Cmd::Snippet { cmd } => snippet_cmd(cmd),
+        Cmd::Fwd { cmd } => fwd_cmd(cmd),
+        Cmd::Apply { ssh_dir } => apply(ssh_dir),
+        Cmd::Export => {
+            let v = open_vault()?;
+            println!("{}", serde_json::to_string_pretty(&v.export_json())?);
+            Ok(())
+        }
+        Cmd::Import { file } => import(&file),
+    }
+}
+
+fn init(device_name: &str) -> Result<()> {
+    let dir = vault::default_dir();
+    let pass = prompt_new_passphrase()?;
+    let (_vault, phrase) = Vault::init(&dir, device_name, &pass)?;
+    println!("Vault created at {}", dir.display());
+    println!("\nYour recovery phrase (24 words). Write it down and store it OFFLINE —");
+    println!("it is the ONLY way to recover your vault if you lose this device:\n");
+    println!("    {phrase}\n");
+    println!("Next steps:");
+    println!("    sshvault host add <alias> --hostname <host>   # add your first host");
+    println!("    sshvault apply                                # wire it into ~/.ssh/config");
+    Ok(())
+}
+
+fn host_cmd(cmd: HostCmd) -> Result<()> {
+    let mut v = open_vault()?;
+    match cmd {
+        HostCmd::Add { alias, opts } => {
+            let host = Host {
+                alias: alias.clone(),
+                hostname: opts.hostname,
+                port: opts.port,
+                user: opts.user,
+                jump_host: opts.jump,
+                identity_file: opts.identity,
+                tags: opts.tags,
+            };
+            v.add(Kind::Host, "alias", &alias, &host)?;
+            println!("added host '{alias}' — run `sshvault apply` to update ssh config");
+        }
+        HostCmd::Edit { alias, opts } => {
+            let rec = v
+                .find(Kind::Host, "alias", &alias)
+                .with_context(|| format!("host '{alias}' not found"))?;
+            let mut host: Host = rec.payload()?;
+            if let Some(x) = opts.hostname {
+                host.hostname = Some(x)
+            }
+            if let Some(x) = opts.port {
+                host.port = Some(x)
+            }
+            if let Some(x) = opts.user {
+                host.user = Some(x)
+            }
+            if let Some(x) = opts.jump {
+                host.jump_host = Some(x)
+            }
+            if let Some(x) = opts.identity {
+                host.identity_file = Some(x)
+            }
+            if !opts.tags.is_empty() {
+                host.tags = opts.tags
+            }
+            v.edit(Kind::Host, "alias", &alias, &host)?;
+            println!("updated host '{alias}' — run `sshvault apply` to update ssh config");
+        }
+        HostCmd::Rm { alias } => {
+            v.remove(Kind::Host, "alias", &alias)?;
+            println!("removed host '{alias}' — run `sshvault apply` to update ssh config");
+        }
+        HostCmd::List => {
+            let mut hosts = v.list::<Host>(Kind::Host);
+            hosts.sort_by(|a, b| a.1.alias.cmp(&b.1.alias));
+            for (_, h) in hosts {
+                let mut line = h.alias.clone();
+                if let Some(hn) = &h.hostname {
+                    let user = h
+                        .user
+                        .as_deref()
+                        .map(|u| format!("{u}@"))
+                        .unwrap_or_default();
+                    let port = h.port.map(|p| format!(":{p}")).unwrap_or_default();
+                    line += &format!("  →  {user}{hn}{port}");
+                }
+                if !h.tags.is_empty() {
+                    line += &format!("  [{}]", h.tags.join(", "));
+                }
+                println!("{line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn snippet_cmd(cmd: SnippetCmd) -> Result<()> {
+    let mut v = open_vault()?;
+    match cmd {
+        SnippetCmd::Add {
+            name,
+            command,
+            description,
+            tags,
+        } => {
+            let s = Snippet {
+                name: name.clone(),
+                command,
+                description,
+                tags,
+            };
+            v.add(Kind::Snippet, "name", &name, &s)?;
+            println!("added snippet '{name}'");
+        }
+        SnippetCmd::Edit {
+            name,
+            command,
+            description,
+            tags,
+        } => {
+            let rec = v
+                .find(Kind::Snippet, "name", &name)
+                .with_context(|| format!("snippet '{name}' not found"))?;
+            let mut s: Snippet = rec.payload()?;
+            if let Some(x) = command {
+                s.command = x
+            }
+            if let Some(x) = description {
+                s.description = Some(x)
+            }
+            if !tags.is_empty() {
+                s.tags = tags
+            }
+            v.edit(Kind::Snippet, "name", &name, &s)?;
+            println!("updated snippet '{name}'");
+        }
+        SnippetCmd::Rm { name } => {
+            v.remove(Kind::Snippet, "name", &name)?;
+            println!("removed snippet '{name}'");
+        }
+        SnippetCmd::List => {
+            let mut snippets = v.list::<Snippet>(Kind::Snippet);
+            snippets.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+            for (_, s) in snippets {
+                let desc = s
+                    .description
+                    .as_deref()
+                    .map(|d| format!("  # {d}"))
+                    .unwrap_or_default();
+                println!("{}  →  {}{desc}", s.name, s.command);
+            }
+        }
+        SnippetCmd::Run { name } => {
+            let rec = v
+                .find(Kind::Snippet, "name", &name)
+                .with_context(|| format!("snippet '{name}' not found"))?;
+            let s: Snippet = rec.payload()?;
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            let status = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(&s.command)
+                .status()
+                .with_context(|| format!("failed to run snippet '{name}'"))?;
+            if !status.success() {
+                bail!("snippet '{name}' exited with {status}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fwd_cmd(cmd: FwdCmd) -> Result<()> {
+    let mut v = open_vault()?;
+    match cmd {
+        FwdCmd::Add {
+            name,
+            spec,
+            host,
+            kind,
+        } => {
+            let kind: ForwardKind = kind.into();
+            sshconfig::validate_forward_spec(kind, &spec)?;
+            if v.find(Kind::Host, "alias", &host).is_none() {
+                bail!("host '{host}' not found — add it first with `sshvault host add {host}`");
+            }
+            let f = PortForward {
+                name: name.clone(),
+                kind,
+                spec,
+                host,
+            };
+            v.add(Kind::PortForward, "name", &name, &f)?;
+            println!("added forward '{name}' — run `sshvault apply` to update ssh config");
+        }
+        FwdCmd::Rm { name } => {
+            v.remove(Kind::PortForward, "name", &name)?;
+            println!("removed forward '{name}' — run `sshvault apply` to update ssh config");
+        }
+        FwdCmd::List => {
+            let mut fwds = v.list::<PortForward>(Kind::PortForward);
+            fwds.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+            for (_, f) in fwds {
+                let kind = match f.kind {
+                    ForwardKind::Local => "local",
+                    ForwardKind::Remote => "remote",
+                    ForwardKind::Dynamic => "dynamic",
+                };
+                println!("{}  {kind}  {}  (host: {})", f.name, f.spec, f.host);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply(ssh_dir: Option<PathBuf>) -> Result<()> {
+    let v = open_vault()?;
+    let ssh_dir = match ssh_dir {
+        Some(d) => d,
+        None => dirs::home_dir()
+            .context("cannot determine home directory")?
+            .join(".ssh"),
+    };
+    let hosts: Vec<Host> = v.list(Kind::Host).into_iter().map(|(_, h)| h).collect();
+    let fwds: Vec<PortForward> = v
+        .list(Kind::PortForward)
+        .into_iter()
+        .map(|(_, f)| f)
+        .collect();
+    let n_hosts = hosts.len();
+    let applied = sshconfig::apply(&hosts, &fwds, &ssh_dir)?;
+    println!("wrote {} ({n_hosts} hosts)", applied.managed_path.display());
+    if applied.include_added {
+        println!(
+            "added `Include` directive to {}",
+            ssh_dir.join("config").display()
+        );
+    }
+    Ok(())
+}
+
+fn import(file: &str) -> Result<()> {
+    let json: serde_json::Value = if file == "-" {
+        serde_json::from_reader(std::io::stdin()).context("stdin is not valid JSON")?
+    } else {
+        serde_json::from_str(
+            &std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?,
+        )
+        .with_context(|| format!("{file} is not valid JSON"))?
+    };
+    let mut v = open_vault()?;
+    let (imported, skipped) = v.import_json(&json)?;
+    println!("imported {imported} records ({skipped} skipped as duplicates)");
+    Ok(())
+}
+
+// ---- helpers ----------------------------------------------------------------
+
+fn open_vault() -> Result<Vault> {
+    let dir = vault::default_dir();
+    let pass = passphrase("Vault passphrase: ")?;
+    Ok(Vault::open(&dir, &pass)?)
+}
+
+/// `$SSHVAULT_PASSPHRASE` (scripts/tests) or interactive prompt.
+fn passphrase(prompt: &str) -> Result<String> {
+    if let Ok(p) = std::env::var("SSHVAULT_PASSPHRASE") {
+        return Ok(p);
+    }
+    rpassword::prompt_password(prompt).context("failed to read passphrase")
+}
+
+fn prompt_new_passphrase() -> Result<String> {
+    if let Ok(p) = std::env::var("SSHVAULT_PASSPHRASE") {
+        return Ok(p);
+    }
+    let first = rpassword::prompt_password("Choose a vault passphrase: ")?;
+    if first.len() < 8 {
+        bail!("passphrase must be at least 8 characters");
+    }
+    let second = rpassword::prompt_password("Repeat passphrase: ")?;
+    if first != second {
+        bail!("passphrases do not match");
+    }
+    Ok(first)
+}
+
+fn hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unnamed-device".into())
+}
