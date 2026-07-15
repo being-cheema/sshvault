@@ -50,6 +50,21 @@ enum Cmd {
         /// Path to a JSON file produced by `sshvault export` ("-" for stdin)
         file: String,
     },
+    /// Sync with a relay (push local changes, pull remote ones)
+    Sync {
+        /// Relay URL, e.g. https://relay.example.com — remembered after first use
+        #[arg(long)]
+        relay: Option<String>,
+    },
+    /// Run the relay server (zero-knowledge blob store)
+    Serve {
+        /// Address to listen on
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        addr: String,
+        /// SQLite database path
+        #[arg(long, default_value = "sshvault-relay.db")]
+        db: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -182,6 +197,8 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Import { file } => import(&file),
+        Cmd::Sync { relay } => sync(relay),
+        Cmd::Serve { addr, db } => serve(&addr, &db),
     }
 }
 
@@ -429,6 +446,30 @@ fn import(file: &str) -> Result<()> {
 }
 
 // ---- helpers ----------------------------------------------------------------
+
+fn sync(relay: Option<String>) -> Result<()> {
+    let mut v = open_vault()?;
+    let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
+    rt.block_on(async {
+        if let Some(url) = relay {
+            let url = url.trim_end_matches('/').to_string();
+            v.set_relay_url(&url)?;
+            sshvault::sync::enroll(&v, &url).await?;
+            println!("enrolled this device with {url}");
+        }
+        let (pushed, pulled) = sshvault::sync::sync_once(&mut v).await?;
+        println!("synced: {pushed} pushed, {pulled} pulled");
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+fn serve(addr: &str, db: &str) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
+    let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
+    rt.block_on(sshvault::relay::serve(addr, db))
+}
 
 fn open_vault() -> Result<Vault> {
     let dir = vault::default_dir();

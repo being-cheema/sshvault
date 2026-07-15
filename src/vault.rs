@@ -102,6 +102,9 @@ const META: &str = "meta.json";
 const KEYRING: &str = "keyring.enc";
 const LOG: &str = "log.bin";
 
+/// A raw log frame: 16-byte entry id + its sealed blob.
+pub type RawEntry = ([u8; 16], Vec<u8>);
+
 impl Vault {
     /// Create a new vault. Returns the vault and the 24-word recovery phrase —
     /// the only time it is ever available.
@@ -110,13 +113,36 @@ impl Vault {
         device_name: &str,
         passphrase: &str,
     ) -> Result<(Vault, String), VaultError> {
+        let (phrase, phrase_keys) = crypto::new_phrase();
+        let recovery_pub = phrase_keys.recovery_signing.verifying_key().to_bytes();
+        let vault = Self::create(
+            dir,
+            device_name,
+            passphrase,
+            Uuid::new_v4(),
+            &phrase_keys.vault_key,
+            &recovery_pub,
+        )?;
+        Ok((vault, phrase))
+    }
+
+    /// Create a vault directory for a device joining an existing vault: it shares
+    /// the `vault_id` and `vault_key` (obtained via enrollment or recovery) but
+    /// gets its own fresh device keypair and an empty log to sync into.
+    pub fn create(
+        dir: &Path,
+        device_name: &str,
+        passphrase: &str,
+        vault_id: Uuid,
+        vault_key: &Secret32,
+        recovery_pub: &[u8; 32],
+    ) -> Result<Vault, VaultError> {
         if dir.join(META).exists() {
             return Err(VaultError::AlreadyExists(dir.to_path_buf()));
         }
         fs::create_dir_all(dir)?;
         restrict_permissions(dir)?;
 
-        let (phrase, phrase_keys) = crypto::new_phrase();
         let device = crypto::new_device_keys();
         let kdf = KdfParams {
             salt_b64: b64(&crypto::random_bytes::<16>()),
@@ -125,19 +151,19 @@ impl Vault {
             p: crypto::ARGON2_P,
         };
         let meta = Meta {
-            vault_id: Uuid::new_v4(),
+            vault_id,
             device_id: Uuid::new_v4(),
             device_name: device_name.to_string(),
             kdf,
             x25519_pub_b64: b64(x25519_dalek::PublicKey::from(&device.x25519).as_bytes()),
             ed25519_pub_b64: b64(device.ed25519.verifying_key().as_bytes()),
-            recovery_pub_b64: b64(phrase_keys.recovery_signing.verifying_key().as_bytes()),
+            recovery_pub_b64: b64(recovery_pub),
             lamport: 0,
             relay_url: None,
             sync_cursor: 0,
         };
         let keyring = Keyring {
-            vault_key: *phrase_keys.vault_key,
+            vault_key: **vault_key,
             x25519_secret: device.x25519.to_bytes(),
             ed25519_secret: device.ed25519.to_bytes(),
         };
@@ -151,7 +177,7 @@ impl Vault {
         vault.write_meta()?;
         fs::File::create(dir.join(LOG))?;
         restrict_permissions(&dir.join(LOG))?;
-        Ok((vault, phrase))
+        Ok(vault)
     }
 
     /// Unlock an existing vault with the passphrase and replay its log.
@@ -316,19 +342,25 @@ impl Vault {
         );
         let key = self.vault_key();
         let blob = crypto::seal(&key, &plain, entry_id.as_bytes());
+        self.write_frame(entry_id.as_bytes(), &blob)?;
+        self.state
+            .entry(record.id)
+            .and_modify(|cur| *cur = merge::merge(cur, record))
+            .or_insert_with(|| record.clone());
+        Ok(())
+    }
+
+    /// Append one raw frame (`u32 len || entry_id(16) || blob`) to the log.
+    fn write_frame(&self, entry_id: &[u8; 16], blob: &[u8]) -> Result<(), VaultError> {
         let mut frame = Vec::with_capacity(4 + 16 + blob.len());
-        frame.extend_from_slice(&(16 + blob.len() as u32).to_le_bytes());
-        frame.extend_from_slice(entry_id.as_bytes());
-        frame.extend_from_slice(&blob);
+        frame.extend_from_slice(&((16 + blob.len()) as u32).to_le_bytes());
+        frame.extend_from_slice(entry_id);
+        frame.extend_from_slice(blob);
         let mut f = fs::OpenOptions::new()
             .append(true)
             .open(self.dir.join(LOG))?;
         f.write_all(&frame)?;
         f.sync_all()?;
-        self.state
-            .entry(record.id)
-            .and_modify(|cur| *cur = merge::merge(cur, record))
-            .or_insert_with(|| record.clone());
         Ok(())
     }
 
@@ -338,26 +370,76 @@ impl Vault {
         let key = self.vault_key();
         let mut data = Vec::new();
         fs::File::open(self.dir.join(LOG))?.read_to_end(&mut data)?;
-        let mut records = Vec::new();
-        let mut off = 0usize;
-        while off + 4 <= data.len() {
-            let len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
-            off += 4;
-            if len < 16 || off + len > data.len() {
-                return Err(VaultError::Corrupt("truncated log frame".into()));
-            }
-            let entry_id = &data[off..off + 16];
-            let blob = &data[off + 16..off + len];
-            let plain = crypto::open(&key, blob, entry_id)?;
+        let frames = parse_frames(&data)?;
+        let mut records = Vec::with_capacity(frames.len());
+        for (id, blob) in &frames {
+            let plain = crypto::open(&key, blob, id)?;
             let rec: Record = rmp_serde::from_slice(&plain)
                 .map_err(|e| VaultError::Corrupt(format!("log entry: {e}")))?;
             records.push(rec);
-            off += len;
-        }
-        if off != data.len() {
-            return Err(VaultError::Corrupt("trailing bytes in log".into()));
         }
         self.state = merge::merge_all(&records);
+        Ok(())
+    }
+
+    // ---- sync surface (Phase 3) --------------------------------------------
+
+    pub fn vault_id(&self) -> Uuid {
+        self.meta.vault_id
+    }
+    pub fn device_id(&self) -> Uuid {
+        self.meta.device_id
+    }
+    /// This device's Ed25519 public key (relay identity / auth).
+    pub fn ed25519_pub(&self) -> [u8; 32] {
+        self.signing_key().verifying_key().to_bytes()
+    }
+    pub fn relay_url(&self) -> Option<&str> {
+        self.meta.relay_url.as_deref()
+    }
+    pub fn set_relay_url(&mut self, url: &str) -> Result<(), VaultError> {
+        self.meta.relay_url = Some(url.to_string());
+        self.write_meta()
+    }
+    /// Highest relay sequence number this device has pulled.
+    pub fn sync_cursor(&self) -> u64 {
+        self.meta.sync_cursor
+    }
+    pub fn set_sync_cursor(&mut self, cursor: u64) -> Result<(), VaultError> {
+        self.meta.sync_cursor = cursor;
+        self.write_meta()
+    }
+
+    /// Raw log frames `(entry_id, sealed_blob)` — no decryption. Feeds push.
+    pub fn raw_entries(&self) -> Result<Vec<RawEntry>, VaultError> {
+        let mut data = Vec::new();
+        fs::File::open(self.dir.join(LOG))?.read_to_end(&mut data)?;
+        parse_frames(&data)
+    }
+
+    /// Apply a sealed entry pulled from the relay: decrypt (proves it belongs to
+    /// this vault), append to the log, merge into state, and advance the local
+    /// lamport past the incoming clock so future local writes stay causally after
+    /// what we've observed. Caller must skip entry_ids already present locally.
+    pub fn apply_remote_entry(
+        &mut self,
+        entry_id: &[u8; 16],
+        blob: &[u8],
+    ) -> Result<(), VaultError> {
+        let key = self.vault_key();
+        let plain = crypto::open(&key, blob, entry_id)?;
+        let rec: Record = rmp_serde::from_slice(&plain)
+            .map_err(|e| VaultError::Corrupt(format!("remote entry: {e}")))?;
+        self.write_frame(entry_id, blob)?;
+        let incoming = rec.clock.lamport;
+        self.state
+            .entry(rec.id)
+            .and_modify(|cur| *cur = merge::merge(cur, &rec))
+            .or_insert(rec);
+        if incoming > self.meta.lamport {
+            self.meta.lamport = incoming;
+            self.write_meta()?;
+        }
         Ok(())
     }
 
@@ -497,6 +579,27 @@ fn validate_payload<T: Serialize>(kind: Kind, payload: &T) -> Result<(), VaultEr
         }
     }
     Ok(())
+}
+
+/// Split raw log bytes into `(entry_id, sealed_blob)` frames without decrypting.
+fn parse_frames(data: &[u8]) -> Result<Vec<RawEntry>, VaultError> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= data.len() {
+        let len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        if len < 16 || off + len > data.len() {
+            return Err(VaultError::Corrupt("truncated log frame".into()));
+        }
+        let id: [u8; 16] = data[off..off + 16].try_into().unwrap();
+        let blob = data[off + 16..off + len].to_vec();
+        out.push((id, blob));
+        off += len;
+    }
+    if off != data.len() {
+        return Err(VaultError::Corrupt("trailing bytes in log".into()));
+    }
+    Ok(out)
 }
 
 fn kind_str(kind: Kind) -> &'static str {
