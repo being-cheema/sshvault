@@ -17,9 +17,15 @@ justifies each choice and pins the exact parameters.
 | zeroization | `zeroize` | all secret key material zeroized on drop |
 | constant-time eq | `subtle` | verification-code and MAC-adjacent comparisons |
 
-Why not `age`/rage: age is file/stream envelope encryption. We need per-record AEAD
-with AAD binding and raw X25519/Ed25519 for enrollment/auth regardless, so age would
-be a second envelope format on top of the same primitives — more surface, no gain.
+**Committed: raw RustCrypto, not `age`/rage.** `age` is *whole-file* envelope
+encryption — one recipient-stanza header, then a single encrypted stream. Our unit
+of sync is the *individual record*: each entry is sealed independently so devices can
+push/pull/merge one record at a time (Phase 2/3). Wrapping every record as its own
+`age` file would mean an X25519 recipient stanza per record (huge overhead) and still
+leaves us needing raw X25519/Ed25519 for enrollment and request auth. So `age` would
+be a second envelope format bolted on top of the same primitives we already use
+directly — more surface, more bytes, no gain. The record format is therefore raw
+`chacha20poly1305` + `x25519-dalek`, full stop. This decision is final for v0.1.
 
 ## Key hierarchy
 
@@ -36,10 +42,46 @@ BIP39 mnemonic (24 words, 256-bit entropy)         generated once at `init`
   the v0.2 extension point).
 - **Recovery keypair**: public half registered with the relay at vault creation; a
   fresh machine holding the phrase can re-derive it, sign an enrollment request, and
-  be auto-approved (`sshvault init --recover`). The relay never sees the seed or VK.
+  be auto-approved (`sshvault recover`). The relay never sees the seed or VK.
 - **Device keys** (generated per device, never derived from the phrase, never leave
   the machine): X25519 static keypair (receives wrapped VK) + Ed25519 keypair
   (signs relay requests).
+
+## Decision: the recovery phrase directly derives the vault key
+
+Two designs were possible for phrase-based recovery:
+
+1. **Direct derivation** — the phrase *is* the root of the key hierarchy. VK is
+   re-derived locally from the phrase every time (`keys_from_phrase`, above). The
+   relay stores nothing that could unwrap the vault.
+2. **Wrapped-blob** — the relay stores a copy of VK wrapped for a recovery key; a
+   recovering device fetches that blob and unwraps it.
+
+**We chose direct derivation.** Rationale:
+
+- **Zero-knowledge stays clean.** With a wrapped blob the relay holds ciphertext of
+  VK — still zero-knowledge in principle, but it's one more piece of key-shaped data
+  on the server whose security rests on the wrap. Direct derivation means there is
+  *no VK-derived material on the relay at all*, so there is simply nothing there to
+  attack. Fewer secrets on the server is strictly better.
+- **No extra construction to get right.** The wrapped-blob path needs its own
+  wrap/rotate/re-store lifecycle (every VK rotation must re-wrap the recovery blob
+  too). Direct derivation reuses the HKDF hierarchy we already have.
+- **The phrase is high-entropy** (256-bit BIP39), so re-derivation is safe without a
+  slow KDF — see the note below.
+
+**What the relay *does* store for recovery, and why it's still zero-knowledge:** the
+`vaults` table keeps the recovery Ed25519 **public** key (`recovery_pub`) so a
+recovering device can prove phrase ownership (sign a challenge → relay maps the
+signature to the right `vault_id`). A public key reveals nothing about VK or the seed;
+it is exactly the kind of non-secret metadata a zero-knowledge relay is allowed to
+hold. The relay never stores the seed, VK, or any wrapped copy of VK.
+
+> **KDF note (as-built).** The recovery phrase feeds **HKDF-SHA256**, not Argon2id.
+> Argon2id exists to stretch *low-entropy* human passphrases; the 24-word phrase
+> already carries 256 bits of entropy, so a memory-hard KDF would add latency for no
+> security gain. Argon2id is used only on the separate passphrase→KEK path (at-rest
+> keyring encryption), where the input genuinely is low-entropy.
 
 ## At-rest protection (local keyring)
 
