@@ -101,6 +101,7 @@ pub fn default_dir() -> PathBuf {
 const META: &str = "meta.json";
 const KEYRING: &str = "keyring.enc";
 const LOG: &str = "log.bin";
+const LOCK: &str = ".lock";
 
 /// A raw log frame: 16-byte entry id + its sealed blob.
 pub type RawEntry = ([u8; 16], Vec<u8>);
@@ -223,6 +224,16 @@ impl Vault {
         };
         vault.replay_log()?;
         Ok(vault)
+    }
+
+    /// Re-read metadata and replay the log from disk, picking up appends and
+    /// lamport/cursor changes made by other sshvault processes on this machine
+    /// (the sync daemon calls this before every round). The keyring never
+    /// changes while a vault stays open, so it is not re-read.
+    pub fn reload(&mut self) -> Result<(), VaultError> {
+        self.meta = serde_json::from_str(&fs::read_to_string(self.dir.join(META))?)
+            .map_err(|e| VaultError::Corrupt(format!("meta.json: {e}")))?;
+        self.replay_log()
     }
 
     /// The vault key (for sync-layer encryption).
@@ -392,8 +403,15 @@ impl Vault {
         Ok(())
     }
 
-    /// Append one raw frame (`u32 len || entry_id(16) || blob`) to the log.
+    /// Append one raw frame (`u32 len || entry_id(16) || blob`) to the log,
+    /// under the exclusive lock so a concurrent reader never sees a torn frame.
     fn write_frame(&self, entry_id: &[u8; 16], blob: &[u8]) -> Result<(), VaultError> {
+        let _lock = self.lock(true)?;
+        self.write_frame_inner(entry_id, blob)
+    }
+
+    /// Append one raw frame; caller already holds the exclusive lock.
+    fn write_frame_inner(&self, entry_id: &[u8; 16], blob: &[u8]) -> Result<(), VaultError> {
         let mut frame = Vec::with_capacity(4 + 16 + blob.len());
         frame.extend_from_slice(&((16 + blob.len()) as u32).to_le_bytes());
         frame.extend_from_slice(entry_id);
@@ -409,10 +427,13 @@ impl Vault {
     /// Decrypt and fold the whole log into state.
     /// ponytail: full replay on open; add snapshot/compaction past ~10k entries
     fn replay_log(&mut self) -> Result<(), VaultError> {
+        let frames = {
+            let _lock = self.lock(false)?;
+            let mut data = Vec::new();
+            fs::File::open(self.dir.join(LOG))?.read_to_end(&mut data)?;
+            parse_frames(&data)?
+        };
         let key = self.vault_key();
-        let mut data = Vec::new();
-        fs::File::open(self.dir.join(LOG))?.read_to_end(&mut data)?;
-        let frames = parse_frames(&data)?;
         let mut records = Vec::with_capacity(frames.len());
         for (id, blob) in &frames {
             let plain = crypto::open(&key, blob, id)?;
@@ -440,6 +461,8 @@ impl Vault {
         self.meta.relay_url.as_deref()
     }
     pub fn set_relay_url(&mut self, url: &str) -> Result<(), VaultError> {
+        let _lock = self.lock(true)?;
+        self.absorb_disk_meta();
         self.meta.relay_url = Some(url.to_string());
         self.write_meta()
     }
@@ -448,12 +471,16 @@ impl Vault {
         self.meta.sync_cursor
     }
     pub fn set_sync_cursor(&mut self, cursor: u64) -> Result<(), VaultError> {
-        self.meta.sync_cursor = cursor;
+        let _lock = self.lock(true)?;
+        self.absorb_disk_meta();
+        // The cursor only ever advances; never let a stale caller move it back.
+        self.meta.sync_cursor = self.meta.sync_cursor.max(cursor);
         self.write_meta()
     }
 
     /// Raw log frames `(entry_id, sealed_blob)` — no decryption. Feeds push.
     pub fn raw_entries(&self) -> Result<Vec<RawEntry>, VaultError> {
+        let _lock = self.lock(false)?;
         let mut data = Vec::new();
         fs::File::open(self.dir.join(LOG))?.read_to_end(&mut data)?;
         parse_frames(&data)
@@ -472,7 +499,9 @@ impl Vault {
         let plain = crypto::open(&key, blob, entry_id)?;
         let rec: Record = rmp_serde::from_slice(&plain)
             .map_err(|e| VaultError::Corrupt(format!("remote entry: {e}")))?;
-        self.write_frame(entry_id, blob)?;
+        let _lock = self.lock(true)?;
+        self.absorb_disk_meta();
+        self.write_frame_inner(entry_id, blob)?;
         let incoming = rec.clock.lamport;
         self.state
             .entry(rec.id)
@@ -480,8 +509,8 @@ impl Vault {
             .or_insert(rec);
         if incoming > self.meta.lamport {
             self.meta.lamport = incoming;
-            self.write_meta()?;
         }
+        self.write_meta()?;
         Ok(())
     }
 
@@ -541,9 +570,44 @@ impl Vault {
 
     // ---- internals ----------------------------------------------------------
 
+    /// Advisory inter-process lock on the vault directory (blocking; released
+    /// when the returned handle drops). `syncd` made concurrent vault access by
+    /// multiple sshvault processes the normal case, so every meta.json write
+    /// and every log.bin read/append synchronizes here: exclusive for writers,
+    /// shared for readers (a reader must never observe a half-written frame).
+    fn lock(&self, exclusive: bool) -> Result<fs::File, VaultError> {
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join(LOCK))?;
+        if exclusive {
+            f.lock()?;
+        } else {
+            f.lock_shared()?;
+        }
+        Ok(f)
+    }
+
+    /// Fold the strictly-increasing counters from the on-disk meta into ours.
+    /// A stale in-memory copy (a daemon round spans network awaits; a CLI open
+    /// spans the Argon2 KDF) must never roll back another process's lamport or
+    /// cursor — reused clocks break merge convergence permanently. Callers must
+    /// hold the exclusive lock.
+    fn absorb_disk_meta(&mut self) {
+        if let Ok(s) = fs::read_to_string(self.dir.join(META)) {
+            if let Ok(disk) = serde_json::from_str::<Meta>(&s) {
+                self.meta.lamport = self.meta.lamport.max(disk.lamport);
+                self.meta.sync_cursor = self.meta.sync_cursor.max(disk.sync_cursor);
+            }
+        }
+    }
+
     /// Next lamport clock for a local mutation; persisted before use so a crash
     /// can't reuse a clock value.
     fn next_clock(&mut self) -> Result<Clock, VaultError> {
+        let _lock = self.lock(true)?;
+        self.absorb_disk_meta();
         self.meta.lamport += 1;
         self.write_meta()?;
         Ok(Clock {
@@ -836,5 +900,55 @@ mod tests {
             user_clock > alias_clock,
             "only the changed field gets the new clock"
         );
+    }
+
+    #[test]
+    fn stale_handle_never_rolls_back_the_lamport() {
+        // Model two sshvault processes sharing a vault dir: a long-lived handle
+        // (e.g. syncd, whose in-memory meta predates the KDF-slow CLI open) must
+        // never overwrite meta.json with a lamport behind what another process
+        // has since committed. The lock + absorb_disk_meta path is what prevents
+        // clock reuse and the permanent cross-device divergence it causes.
+        let (tmp, mut stale) = test_vault();
+
+        // A second handle onto the same dir advances the lamport several times.
+        let mut fresh = Vault::open(tmp.path(), "pw").unwrap();
+        for i in 0..5 {
+            fresh
+                .add(
+                    Kind::Host,
+                    "alias",
+                    &format!("h{i}"),
+                    &host(&format!("h{i}")),
+                )
+                .unwrap();
+        }
+        let advanced = fresh.meta.lamport;
+        assert!(advanced >= 5);
+
+        // The stale handle still thinks the lamport is 0. Its next write must
+        // fold in the on-disk value, not clobber it back to ~1.
+        let clock = stale.next_clock().unwrap();
+        assert!(
+            clock.lamport > advanced,
+            "stale writer bumped past the committed lamport ({} > {advanced})",
+            clock.lamport
+        );
+
+        // And the persisted meta reflects the higher value, so a subsequent
+        // open by either process sees a monotonic clock.
+        let on_disk = Vault::open(tmp.path(), "pw").unwrap();
+        assert!(on_disk.meta.lamport >= clock.lamport);
+    }
+
+    #[test]
+    fn sync_cursor_never_regresses() {
+        let (tmp, mut a) = test_vault();
+        let mut b = Vault::open(tmp.path(), "pw").unwrap();
+        a.set_sync_cursor(10).unwrap();
+        // b is stale (cursor 0); advancing it to 5 must not roll disk back.
+        b.set_sync_cursor(5).unwrap();
+        let disk = Vault::open(tmp.path(), "pw").unwrap();
+        assert_eq!(disk.meta.sync_cursor, 10, "cursor only advances");
     }
 }

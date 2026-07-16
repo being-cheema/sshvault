@@ -69,7 +69,7 @@ pub async fn enroll_and_wait(
     on_pending(&code);
 
     // Poll for the wrapped key. ponytail: fixed 2s poll; WS push is a v0.2 nicety.
-    let client = reqwest::Client::new();
+    let client = sync::http_client();
     loop {
         if let Some(wrapped_b64) = poll_wrapped(&client, &v, relay).await? {
             let wrapped = B64
@@ -101,7 +101,7 @@ async fn poll_wrapped(
 
 /// List every device the relay knows for this vault (approver's view).
 pub async fn list_devices(v: &Vault, relay: &str) -> Result<Vec<DeviceInfo>, SyncError> {
-    let client = reqwest::Client::new();
+    let client = sync::http_client();
     let url = signed_get_url(v, relay, "devices");
     let resp: DevicesResp = sync::parse(client.get(url).send().await?).await?;
     Ok(resp.devices)
@@ -130,7 +130,7 @@ pub async fn approve(v: &Vault, relay: &str, code: &str) -> Result<String, Enrol
         target_pub_b64: target.ed25519_pub_b64.clone(),
         wrapped_key_b64: B64.encode(&wrapped),
     };
-    let client = reqwest::Client::new();
+    let client = sync::http_client();
     let signed = sync::sign(v, serde_json::to_string(&req).expect("approve serializes"));
     let _: crate::proto::PushResp =
         sync::post(&client, format!("{relay}/v1/approve"), &signed).await?;
@@ -143,7 +143,7 @@ pub async fn revoke(v: &Vault, relay: &str, code: &str) -> Result<String, Enroll
     let req = RevokeReq {
         target_pub_b64: target.ed25519_pub_b64.clone(),
     };
-    let client = reqwest::Client::new();
+    let client = sync::http_client();
     let signed = sync::sign(v, serde_json::to_string(&req).expect("revoke serializes"));
     let _: crate::proto::PushResp =
         sync::post(&client, format!("{relay}/v1/revoke"), &signed).await?;
@@ -174,7 +174,7 @@ pub async fn recover(
         x25519_pub_b64: B64.encode(x_pub.as_bytes()),
         sig_b64: B64.encode(sig.to_bytes()),
     };
-    let client = reqwest::Client::new();
+    let client = sync::http_client();
     let http = client
         .post(format!("{relay}/v1/recover"))
         .json(&req)

@@ -34,15 +34,24 @@ pub fn validate_forward_spec(kind: ForwardKind, spec: &str) -> Result<(), ApplyE
     };
     let parts: Vec<&str> = spec.split(':').collect();
     let port_ok = |s: &str| s.parse::<u16>().is_ok();
+    // A bind/host segment becomes an ssh_config token: it must be non-empty and
+    // free of whitespace (which would split the directive or, via a newline,
+    // inject a following line). Empty/space host segments also silently produce
+    // a broken `LocalForward` line, so reject them here rather than at apply.
+    let addr_ok = |s: &str| !s.is_empty() && !s.chars().any(char::is_whitespace);
     match kind {
         ForwardKind::Dynamic => match parts.as_slice() {
             [p] if port_ok(p) => Ok(()),
-            [_bind, p] if port_ok(p) => Ok(()),
+            [bind, p] if addr_ok(bind) && port_ok(p) => Ok(()),
             _ => Err(err("`port` or `bind:port`")),
         },
         ForwardKind::Local | ForwardKind::Remote => match parts.as_slice() {
-            [lp, _host, dp] if port_ok(lp) && port_ok(dp) => Ok(()),
-            [_bind, lp, _host, dp] if port_ok(lp) && port_ok(dp) => Ok(()),
+            [lp, host, dp] if port_ok(lp) && addr_ok(host) && port_ok(dp) => Ok(()),
+            [bind, lp, host, dp]
+                if addr_ok(bind) && port_ok(lp) && addr_ok(host) && port_ok(dp) =>
+            {
+                Ok(())
+            }
             _ => Err(err(
                 "`listen_port:host:port` or `bind:listen_port:host:port`",
             )),
@@ -249,6 +258,29 @@ mod tests {
             "port > u16 rejected"
         );
         assert!(validate_forward_spec(Dynamic, "8080:localhost:80").is_err());
+        // host/bind segments must not be empty or carry whitespace: they become
+        // ssh_config tokens, so a space splits the directive and a newline would
+        // inject a following line.
+        assert!(
+            validate_forward_spec(Local, "8080::80").is_err(),
+            "empty host rejected"
+        );
+        assert!(
+            validate_forward_spec(Local, "8080: :80").is_err(),
+            "whitespace host rejected"
+        );
+        assert!(
+            validate_forward_spec(Local, "8080:evil\nHost x:80").is_err(),
+            "newline in host rejected"
+        );
+        assert!(
+            validate_forward_spec(Remote, " :8080:localhost:80").is_err(),
+            "whitespace bind rejected"
+        );
+        assert!(
+            validate_forward_spec(Dynamic, ":1080").is_err(),
+            "empty bind rejected"
+        );
     }
 
     #[test]

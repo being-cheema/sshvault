@@ -56,6 +56,13 @@ enum Cmd {
         #[arg(long)]
         relay: Option<String>,
     },
+    /// Sync continuously in the foreground: follow relay change notifications
+    /// over WebSocket and reconcile on each one (Ctrl-C to stop)
+    Syncd {
+        /// Also regenerate ~/.ssh/sshvault.conf after every round that pulled changes
+        #[arg(long)]
+        apply: bool,
+    },
     /// Run the relay server (zero-knowledge blob store)
     Serve {
         /// Address to listen on
@@ -186,6 +193,18 @@ enum FwdCmd {
         #[arg(long = "type", value_enum, default_value = "local")]
         kind: FwdType,
     },
+    /// Edit a port-forward (only the flags you pass change)
+    Edit {
+        name: String,
+        /// New spec — local/remote: `port:host:port` · dynamic: `port`
+        #[arg(long)]
+        spec: Option<String>,
+        /// Host alias this forward belongs to
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long = "type", value_enum)]
+        kind: Option<FwdType>,
+    },
     /// Remove a port-forward
     Rm { name: String },
     /// List port-forwards
@@ -234,6 +253,7 @@ fn run() -> Result<()> {
         }
         Cmd::Import { file } => import(&file),
         Cmd::Sync { relay } => sync(relay),
+        Cmd::Syncd { apply } => syncd(apply),
         Cmd::Serve { addr, db } => serve(&addr, &db),
         Cmd::Device { cmd } => device_cmd(cmd),
         Cmd::Recover { relay, device_name } => recover(&relay, &device_name),
@@ -422,6 +442,37 @@ fn fwd_cmd(cmd: FwdCmd) -> Result<()> {
             v.add(Kind::PortForward, "name", &name, &f)?;
             println!("added forward '{name}' — run `sshvault apply` to update ssh config");
         }
+        FwdCmd::Edit {
+            name,
+            spec,
+            host,
+            kind,
+        } => {
+            let rec = v
+                .find(Kind::PortForward, "name", &name)
+                .with_context(|| format!("forward '{name}' not found"))?;
+            let mut f: PortForward = rec.payload()?;
+            if let Some(k) = kind {
+                f.kind = k.into()
+            }
+            if let Some(s) = spec {
+                f.spec = s
+            }
+            if let Some(h) = host {
+                f.host = h
+            }
+            // re-validate against the *final* kind/spec/host combination
+            sshconfig::validate_forward_spec(f.kind, &f.spec)?;
+            if v.find(Kind::Host, "alias", &f.host).is_none() {
+                bail!(
+                    "host '{}' not found — add it first with `sshvault host add {}`",
+                    f.host,
+                    f.host
+                );
+            }
+            v.edit(Kind::PortForward, "name", &name, &f)?;
+            println!("updated forward '{name}' — run `sshvault apply` to update ssh config");
+        }
         FwdCmd::Rm { name } => {
             v.remove(Kind::PortForward, "name", &name)?;
             println!("removed forward '{name}' — run `sshvault apply` to update ssh config");
@@ -444,6 +495,10 @@ fn fwd_cmd(cmd: FwdCmd) -> Result<()> {
 
 fn apply(ssh_dir: Option<PathBuf>) -> Result<()> {
     let v = open_vault()?;
+    apply_vault(&v, ssh_dir)
+}
+
+fn apply_vault(v: &Vault, ssh_dir: Option<PathBuf>) -> Result<()> {
     let ssh_dir = match ssh_dir {
         Some(d) => d,
         None => dirs::home_dir()
@@ -498,6 +553,33 @@ fn sync(relay: Option<String>) -> Result<()> {
         let (pushed, pulled) = sshvault::sync::sync_once(&mut v).await?;
         println!("synced: {pushed} pushed, {pulled} pulled");
         Ok::<_, anyhow::Error>(())
+    })
+}
+
+fn syncd(apply: bool) -> Result<()> {
+    let mut v = open_vault()?;
+    if v.relay_url().is_none() {
+        bail!("no relay configured — run `sshvault sync --relay <url>` once to set it");
+    }
+    let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
+    rt.block_on(async {
+        println!("syncd: watching relay for changes (Ctrl-C to stop)");
+        tokio::select! {
+            r = sshvault::sync::syncd(&mut v, |v, pushed, pulled| {
+                if pushed + pulled > 0 {
+                    println!("synced: {pushed} pushed, {pulled} pulled");
+                }
+                if apply && pulled > 0 {
+                    if let Err(e) = apply_vault(v, None) {
+                        eprintln!("apply failed: {e:#}");
+                    }
+                }
+            }) => r.map_err(anyhow::Error::from),
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nsyncd: stopped");
+                Ok(())
+            }
+        }
     })
 }
 

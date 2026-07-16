@@ -111,6 +111,16 @@ Server tables: `vaults`, `devices` (pubkeys, status, wrapped vault key), `entrie
 (vault_id, seq, entry_id, blob). No plaintext columns; Phase 3 gate greps blobs.
 
 Offline-first: all CLI ops touch only the local log; `sync` reconciles when reachable.
+`sshvault syncd` follows the relay live: it subscribes to `/v1/ws` and runs a
+push/pull round on every head announcement, with a 30 s fallback poll (that's what
+pushes appends made by other local sshvault processes; overridable via
+`SSHVAULT_SYNCD_POLL_SECS`), capped-exponential reconnect backoff that only resets
+once a connection has held ≥30 s (so a flapping relay isn't hammered), and a
+`Vault::reload` before each round. Concurrent sshvault processes on one machine are
+safe: every meta.json write and log.bin read/append takes an advisory file lock
+(`.lock`, exclusive for writers / shared for readers) and re-folds the on-disk
+lamport + sync cursor before persisting, so a stale handle can never roll a counter
+back and reuse a clock.
 
 ## Device lifecycle (Phase 4)
 

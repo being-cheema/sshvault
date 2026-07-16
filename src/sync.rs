@@ -15,6 +15,17 @@ use std::collections::HashSet;
 type B64 = base64::engine::general_purpose::GeneralPurpose;
 pub(crate) const B64: B64 = base64::engine::general_purpose::STANDARD;
 
+/// Shared HTTP client with bounded timeouts. Without these a relay that accepts
+/// the TCP connection but never responds (black-holed by a firewall, or hung)
+/// would wedge a sync round — and the `syncd` daemon — indefinitely.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client builds from static config")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
     #[error("no relay configured — run `sshvault sync --relay <url>` once to set it")]
@@ -67,7 +78,7 @@ pub(crate) async fn parse<T: serde::de::DeserializeOwned>(
 /// Register this device with the relay. Returns whether it is already approved
 /// (true only for the device that bootstrapped the vault).
 pub async fn enroll(v: &Vault, relay: &str) -> Result<bool, SyncError> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let req = EnrollReq {
         device_name: v.meta.device_name.clone(),
         ed25519_pub_b64: B64.encode(v.ed25519_pub()),
@@ -83,7 +94,7 @@ pub async fn enroll(v: &Vault, relay: &str) -> Result<bool, SyncError> {
 /// lack and merge it. Returns `(pushed, pulled)` entry counts.
 pub async fn sync_once(v: &mut Vault) -> Result<(usize, usize), SyncError> {
     let relay = v.relay_url().ok_or(SyncError::NoRelay)?.to_string();
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     // Push: send all local entries; the relay ignores ones it already has.
     let local = v.raw_entries()?;
@@ -131,6 +142,128 @@ pub async fn sync_once(v: &mut Vault) -> Result<(usize, usize), SyncError> {
     }
     v.set_sync_cursor(resp.head)?;
     Ok((pushed.stored, pulled))
+}
+
+/// How often the daemon runs a round even without a relay notification. This is
+/// what pushes entries that *other* local sshvault processes appended (the relay
+/// only announces remote pushes) and heals any missed WS notification.
+const SYNCD_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Resolve the fallback poll interval. Normally [`SYNCD_POLL`], but overridable
+/// via `SSHVAULT_SYNCD_POLL_SECS` — an advanced operational knob that also lets
+/// the daemon test push the fallback far out, so that any convergence it
+/// observes can only have come from a WS notification, not the tick.
+fn syncd_poll() -> std::time::Duration {
+    std::env::var("SSHVAULT_SYNCD_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(SYNCD_POLL)
+}
+
+/// A WebSocket must stay up at least this long to count as a healthy connection
+/// and reset the reconnect backoff. Shorter-lived connections keep the backoff
+/// climbing so a flapping relay is retried with increasing delay, not hammered.
+const HEALTHY_CONN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run sync continuously (`sshvault syncd`): an immediate round, then a round
+/// whenever the relay announces a new head over its `/v1/ws` WebSocket, with the
+/// [`syncd_poll`] tick as fallback and capped-exponential reconnect backoff.
+/// `on_round` fires after every successful round with `(vault, pushed, pulled)`.
+///
+/// Transient failures (relay unreachable, 5xx) are retried forever; fatal ones
+/// (local storage errors, or the relay actively refusing us — e.g. this device
+/// was revoked) return. Runs until the caller drops/aborts the future.
+pub async fn syncd(
+    v: &mut Vault,
+    mut on_round: impl FnMut(&Vault, usize, usize),
+) -> Result<(), SyncError> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let relay = v.relay_url().ok_or(SyncError::NoRelay)?.to_string();
+    // http(s):// → ws(s)://; the notify endpoint is unauthenticated by design
+    // (it leaks only "something changed") — the pull that follows is signed.
+    let ws_url = format!(
+        "{}/v1/ws?vault={}",
+        relay.replacen("http", "ws", 1),
+        urlencode(&B64.encode(v.vault_id().as_bytes())),
+    );
+
+    let mut backoff_secs = 1u64;
+    loop {
+        round(v, &mut on_round).await?;
+        let connected_at = tokio::time::Instant::now();
+        let mut ws = match tokio_tungstenite::connect_async(ws_url.as_str()).await {
+            Ok((ws, _)) => ws,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(60);
+                continue;
+            }
+        };
+        let mut tick = tokio::time::interval(syncd_poll());
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // interval yields immediately once; skip that
+        loop {
+            tokio::select! {
+                msg = ws.next() => match msg {
+                    // the relay broadcasts its new head; skip echoes of our own push
+                    Some(Ok(Message::Text(head))) => {
+                        let stale = match head.as_str().trim().parse::<u64>() {
+                            Ok(h) => h > v.sync_cursor(),
+                            Err(_) => true, // unrecognized message — resync defensively
+                        };
+                        if stale {
+                            round(v, &mut on_round).await?;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {} // ping/pong — tungstenite answers pings itself
+                },
+                _ = tick.tick() => round(v, &mut on_round).await?,
+            }
+        }
+        // Socket dropped — reconnect, resyncing in case a notify was missed.
+        // Only clear the backoff if this connection actually held for a while;
+        // a relay that accepts the handshake then immediately drops us (crash
+        // loop, or refusing this vault at the WS layer) must not reset us into a
+        // tight reconnect spin — it should keep climbing toward the 60s cap.
+        if connected_at.elapsed() >= HEALTHY_CONN {
+            backoff_secs = 1;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(60);
+        }
+    }
+}
+
+/// One daemon round: reload local state from disk (another sshvault process may
+/// have appended), then push/pull. Transient errors are swallowed — the daemon
+/// loop retries; fatal ones bubble.
+async fn round(
+    v: &mut Vault,
+    on_round: &mut impl FnMut(&Vault, usize, usize),
+) -> Result<(), SyncError> {
+    v.reload()?;
+    match sync_once(v).await {
+        Ok((pushed, pulled)) => {
+            on_round(v, pushed, pulled);
+            Ok(())
+        }
+        Err(e) if transient(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Worth retrying (relay down / server error) vs. fatal (local storage broke,
+/// or the relay actively refused us — bad auth, revoked device).
+fn transient(e: &SyncError) -> bool {
+    match e {
+        SyncError::Http(_) => true,
+        SyncError::Rejected { status, .. } => *status >= 500,
+        SyncError::NoRelay | SyncError::Vault(_) => false,
+    }
 }
 
 fn decode16(b64: &str) -> Result<[u8; 16], SyncError> {
