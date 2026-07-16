@@ -19,8 +19,9 @@
 //! revoked device cannot re-enroll its way back in.
 
 use crate::proto::{
-    ApproveReq, DeviceInfo, DevicesResp, EnrollReq, EnrollResp, PullResp, PushReq, PushResp,
-    RecoverReq, RecoverResp, RevokeReq, Signed, WireEntry, WrappedResp,
+    now_unix, signing_message, ApproveReq, DeviceInfo, DevicesResp, EnrollReq, EnrollResp,
+    PullResp, PushReq, PushResp, RecoverReq, RecoverResp, RevokeReq, Signed, WireEntry,
+    WrappedResp, MAX_SKEW_SECS,
 };
 use axum::{
     extract::{ws::WebSocketUpgrade, Query, State},
@@ -115,11 +116,18 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
 
 // ---- auth -------------------------------------------------------------------
 
-/// Verify the Ed25519 signature over `body` and return the decoded 16-byte
-/// vault id and the device's public key bytes. Does NOT check enrollment.
+/// Verify the Ed25519 signature over `signing_message(ts, body)` and check the
+/// timestamp is within [`MAX_SKEW_SECS`] of relay time. Returns the decoded
+/// 16-byte vault id (base64) and the device's public key. Does NOT check
+/// enrollment. Binding `ts` into the signed message bounds replay of any
+/// captured envelope to the skew window.
 fn verify(signed: &Signed) -> Result<(String, VerifyingKey), (StatusCode, String)> {
     let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string());
     let unauth = |m: &str| (StatusCode::UNAUTHORIZED, m.to_string());
+    // Reject stale or far-future timestamps before touching the signature.
+    if (now_unix() - signed.ts).abs() > MAX_SKEW_SECS {
+        return Err(unauth("request timestamp outside acceptance window"));
+    }
     let pub_bytes: [u8; 32] = B64
         .decode(&signed.device_pub_b64)
         .ok()
@@ -133,7 +141,8 @@ fn verify(signed: &Signed) -> Result<(String, VerifyingKey), (StatusCode, String
         .and_then(|v| v.try_into().ok())
         .ok_or_else(|| bad("sig"))?;
     let sig = Signature::from_bytes(&sig_bytes);
-    key.verify(signed.body.as_bytes(), &sig)
+    let msg = signing_message(signed.ts, &signed.body);
+    key.verify(msg.as_bytes(), &sig)
         .map_err(|_| unauth("signature does not verify"))?;
     Ok((signed.vault_id_b64.clone(), key))
 }
@@ -469,18 +478,22 @@ struct PullQuery {
     vault: String,
     /// base64 device pub
     device: String,
-    /// base64 signature over the string "pull:<since>"
+    /// base64 signature over `signing_message(ts, "pull:<since>")`
     sig: String,
     since: u64,
+    /// unix seconds the request was signed at
+    ts: i64,
 }
 
 /// A signed GET whose body is `"<action>:<vault_b64>"` — used for endpoints that
-/// carry no request body of their own (devices, wrapped).
+/// carry no request body of their own (devices, wrapped). The `ts` is bound into
+/// the signature exactly as in the POST envelope.
 #[derive(Deserialize)]
 struct SignedQuery {
     vault: String,
     device: String,
     sig: String,
+    ts: i64,
 }
 
 impl SignedQuery {
@@ -490,6 +503,7 @@ impl SignedQuery {
             vault_id_b64: self.vault,
             device_pub_b64: self.device,
             sig_b64: self.sig,
+            ts: self.ts,
             body,
         }
     }
@@ -504,6 +518,7 @@ async fn pull(
         vault_id_b64: q.vault.clone(),
         device_pub_b64: q.device.clone(),
         sig_b64: q.sig.clone(),
+        ts: q.ts,
         body: format!("pull:{}", q.since),
     };
     let (vault, key) = verify(&signed)?;

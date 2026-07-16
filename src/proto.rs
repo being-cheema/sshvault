@@ -131,8 +131,33 @@ pub struct RecoverResp {
 pub struct Signed {
     pub vault_id_b64: String,
     pub device_pub_b64: String,
-    /// Detached Ed25519 signature over `body` bytes, base64.
+    /// Detached Ed25519 signature over [`signing_message`]`(ts, body)`, base64.
     pub sig_b64: String,
+    /// Unix seconds when the request was signed. Bound into the signature and
+    /// checked by the relay against [`MAX_SKEW_SECS`] to bound replay.
+    pub ts: i64,
     /// The inner request, serialized to a JSON string (signed verbatim).
     pub body: String,
+}
+
+/// Maximum accepted clock skew between a signed request's `ts` and relay time.
+/// A captured signature is replayable only inside this window (and then only
+/// onto idempotent operations — see `docs/crypto-design.md`).
+pub const MAX_SKEW_SECS: i64 = 300;
+
+/// The exact bytes an Ed25519 device signature covers: the request timestamp
+/// bound to the body, so a captured signature cannot be replayed outside its
+/// freshness window. Both signer (client) and verifier (relay) derive it the
+/// same way, so the two must never diverge.
+pub fn signing_message(ts: i64, body: &str) -> String {
+    format!("{ts}\n{body}")
+}
+
+/// Current unix time in seconds (signed, so relay skew math can go negative when
+/// a client clock runs ahead).
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

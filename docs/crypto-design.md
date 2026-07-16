@@ -139,19 +139,59 @@ wrapped keys.
 
 ## Relay request auth
 
-Every mutating/reading relay call carries:
+Every relay call that names a vault is Ed25519-signed by the calling device. The
+signature is transported in a JSON envelope (`proto::Signed`) for POSTs, and as
+query parameters for the two signed GETs (`/v1/pull`, `/v1/devices`, `/v1/wrapped`):
 
 ```
-X-Device-Id: uuid
-X-Timestamp: unix seconds        (rejected outside ±300 s)
-X-Signature: base64(Ed25519(method || "\n" || path || "\n" || sha256(body) || "\n" || timestamp))
+Signed {
+  vault_id_b64          // which vault
+  device_pub_b64        // the device verifying key
+  ts                    // unix seconds when signed
+  sig_b64               // Ed25519( signing_message(ts, body) )
+  body                  // the request JSON (POST) or "<action>:<vault_b64>" / "pull:<since>" (GET)
+}
+
+signing_message(ts, body) = "<ts>\n<body>"      // ts is INSIDE the signed bytes
 ```
+
+The relay (`relay::verify`) recomputes `signing_message(ts, body)`, checks the
+signature against `device_pub`, and rejects any request whose `ts` is more than
+`MAX_SKEW_SECS` (±300 s) from relay time. Because `ts` is bound *inside* the
+signed message, an attacker cannot slide a captured signature forward by editing
+the `ts` field — that invalidates the signature. A captured, still-valid envelope
+is therefore replayable only within the ±300 s window.
 
 The relay stores only device public keys — nothing password-shaped. Signature
-verification is constant-time inside ed25519-dalek. Replaying a captured request
-within the window can only re-execute idempotent operations (push of immutable
-entries, reads); revoke is idempotent too.
-<!-- ponytail: no per-request nonce cache; add one if any non-idempotent endpoint appears -->
+verification is constant-time inside ed25519-dalek. Within the 300 s window a
+replay can still re-execute the endpoint, so replay-safety rests on every
+authenticated endpoint being **idempotent**: push inserts immutable entries
+(`INSERT OR IGNORE` on a unique `entry_id`), pull and the signed GETs are reads,
+approve is a guarded idempotent UPDATE (`WHERE revoked = 0`, so a replay can't
+resurrect a revoked device), and revoke is a sticky idempotent UPDATE. No
+authenticated endpoint has a non-idempotent side effect, so a within-window
+replay is a no-op beyond what the original request already did.
+
+`/v1/recover` is deliberately exempt from the `Signed` envelope: the recovering
+device isn't enrolled yet, so it authenticates by signing its *freshly generated*
+Ed25519 device key with the recovery key. Replaying that request only re-admits
+the same device key its author already controls — no timestamp is needed to make
+it safe.
+
+<!-- ponytail: no per-request nonce cache; the ±300 s window + idempotency is the
+     v0.1 replay story. Add a seen-signature cache if any non-idempotent
+     authenticated endpoint is ever introduced. -->
+
+## Device short code (out-of-band verification)
+
+`sshvault device approve/revoke <code>` identifies a target device by a **32-bit**
+short code — the first 4 bytes of its Ed25519 public key, rendered as `aabb-ccdd`.
+This is a human-readable handle for the approve/revoke UX, **not** a cryptographic
+authenticator: the approver still wraps the vault key for the target's full
+X25519/Ed25519 keys, and a code collision surfaces as an explicit "ambiguous code"
+error (`EnrollError::AmbiguousCode`), never a silent wrong-device approval. Treat
+the short code as a convenience label with collision *detection*, not a 128-bit
+identity. See `threat-model.md` for the trust decision this sits inside.
 
 ## Zeroization
 

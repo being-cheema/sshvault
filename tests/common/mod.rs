@@ -1,4 +1,8 @@
 //! Shared helpers for the sync/device integration tests.
+//!
+//! Each integration-test binary compiles this module fresh, so a helper used by
+//! only some binaries reads as dead code in the others — allow it here.
+#![allow(dead_code)]
 
 use sshvault::record::{Host, Kind};
 use sshvault::vault::Vault;

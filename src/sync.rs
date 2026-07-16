@@ -3,7 +3,10 @@
 //! against the enrolled public key. The vault key never leaves the machine —
 //! only sealed blobs cross the wire.
 
-use crate::proto::{EnrollReq, EnrollResp, PullResp, PushReq, PushResp, Signed, WireEntry};
+use crate::proto::{
+    now_unix, signing_message, EnrollReq, EnrollResp, PullResp, PushReq, PushResp, Signed,
+    WireEntry,
+};
 use crate::vault::{Vault, VaultError};
 use base64::Engine;
 use ed25519_dalek::Signer;
@@ -24,13 +27,17 @@ pub enum SyncError {
     Vault(#[from] VaultError),
 }
 
-/// Sign `body` with the device key and wrap it in a [`Signed`] envelope.
+/// Sign `body` with the device key and wrap it in a [`Signed`] envelope. The
+/// signature covers a fresh timestamp bound to the body so the relay can bound
+/// replay of the captured envelope.
 pub(crate) fn sign(v: &Vault, body: String) -> Signed {
-    let sig = v.signing_key().sign(body.as_bytes());
+    let ts = now_unix();
+    let sig = v.signing_key().sign(signing_message(ts, &body).as_bytes());
     Signed {
         vault_id_b64: B64.encode(v.vault_id().as_bytes()),
         device_pub_b64: B64.encode(v.ed25519_pub()),
         sig_b64: B64.encode(sig.to_bytes()),
+        ts,
         body,
     }
 }
@@ -90,17 +97,20 @@ pub async fn sync_once(v: &mut Vault) -> Result<(usize, usize), SyncError> {
     let body = serde_json::to_string(&PushReq { entries }).expect("push serializes");
     let pushed: PushResp = post(&client, format!("{relay}/v1/push"), &sign(v, body)).await?;
 
-    // Pull: everything past our cursor.
+    // Pull: everything past our cursor. Signed like the POST envelope — a fresh
+    // timestamp bound to the body — so a captured pull URL can't be replayed
+    // outside the relay's skew window.
     let since = v.sync_cursor();
+    let ts = now_unix();
     let vault_b64 = B64.encode(v.vault_id().as_bytes());
     let device_b64 = B64.encode(v.ed25519_pub());
     let sig = B64.encode(
         v.signing_key()
-            .sign(format!("pull:{since}").as_bytes())
+            .sign(signing_message(ts, &format!("pull:{since}")).as_bytes())
             .to_bytes(),
     );
     let url = format!(
-        "{relay}/v1/pull?vault={}&device={}&sig={}&since={since}",
+        "{relay}/v1/pull?vault={}&device={}&sig={}&since={since}&ts={ts}",
         urlencode(&vault_b64),
         urlencode(&device_b64),
         urlencode(&sig),

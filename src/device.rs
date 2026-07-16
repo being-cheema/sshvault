@@ -213,14 +213,21 @@ async fn find_by_code(v: &Vault, relay: &str, code: &str) -> Result<DeviceInfo, 
 }
 
 /// Build a signed GET URL for `action` (`"devices"`, `"wrapped"`): the device
-/// signs the string `"<action>:<vault_b64>"`, matching the relay's `SignedQuery`.
+/// signs a fresh timestamp bound to the string `"<action>:<vault_b64>"`, matching
+/// the relay's `SignedQuery`. The `ts` travels as a query param so the relay can
+/// reconstruct the exact signed message and bound replay.
 fn signed_get_url(v: &Vault, relay: &str, action: &str) -> String {
+    let ts = crate::proto::now_unix();
     let vault_b64 = B64.encode(v.vault_id().as_bytes());
     let device_b64 = B64.encode(v.ed25519_pub());
     let body = format!("{action}:{vault_b64}");
-    let sig = B64.encode(v.signing_key().sign(body.as_bytes()).to_bytes());
+    let sig = B64.encode(
+        v.signing_key()
+            .sign(crate::proto::signing_message(ts, &body).as_bytes())
+            .to_bytes(),
+    );
     format!(
-        "{relay}/v1/{action}?vault={}&device={}&sig={}",
+        "{relay}/v1/{action}?vault={}&device={}&sig={}&ts={ts}",
         sync::urlencode(&vault_b64),
         sync::urlencode(&device_b64),
         sync::urlencode(&sig),

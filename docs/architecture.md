@@ -92,16 +92,20 @@ State is rebuilt by folding merge over decrypted log entries at startup.
 
 ## Sync protocol (Phase 3)
 
-JSON over HTTP; every request Ed25519-signed by the device
-(`X-Device-Id`, `X-Timestamp`, `X-Signature` over method‖path‖sha256(body)‖timestamp,
-±300 s window).
+JSON over HTTP; every authenticated request is Ed25519-signed by the device. The
+signature covers a timestamp bound into the signed message
+(`signing_message(ts, body)` = `"<ts>\n<body>"`); the relay rejects any request
+whose `ts` is outside a ±300 s window. POSTs carry a `Signed` JSON envelope
+(`{vault_id, device_pub, ts, sig, body}`); the signed GETs carry the same fields
+as query params. See `crypto-design.md` §"Relay request auth".
 
-- `POST /v1/vaults` — register vault + first device
-- `POST /v1/vaults/:id/entries` — push `[{entry_id, blob}]`; server dedupes on
-  entry_id, assigns monotonic `seq`
-- `GET /v1/vaults/:id/entries?since=<seq>` — pull; client persists cursor
-- `GET /v1/vaults/:id/ws` — WebSocket; server broadcasts new `seq` (client then pulls)
-- device lifecycle endpoints (Phase 4): enroll / approve / revoke
+- `POST /v1/enroll` — register a device for a vault (first device bootstraps it)
+- `POST /v1/push` — push `[{entry_id, blob}]`; relay dedupes on entry_id, assigns
+  monotonic `seq`
+- `GET /v1/pull?since=<seq>` — pull entries past the cursor; client persists cursor
+- `GET /v1/ws` — WebSocket; relay broadcasts new `seq` (client then pulls)
+- device lifecycle (Phase 4): `POST /v1/approve` · `POST /v1/revoke` ·
+  `POST /v1/recover` · `GET /v1/devices` · `GET /v1/wrapped`
 
 Server tables: `vaults`, `devices` (pubkeys, status, wrapped vault key), `entries`
 (vault_id, seq, entry_id, blob). No plaintext columns; Phase 3 gate greps blobs.

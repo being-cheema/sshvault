@@ -13,9 +13,13 @@ non-secret routing metadata, and there is no server-side decryption path, ever.
   stored `recovery_pub` is non-secret.
 - **Network attacker (passive or active).** All record contents are XChaCha20-Poly1305
   ciphertext before they reach the wire; the relay only ever relays ciphertext. Every
-  mutating/reading call is Ed25519-signed with a timestamp, so a MITM cannot forge or
-  usefully replay requests (replays land only on idempotent operations, within a ±300 s
-  window).
+  authenticated call is Ed25519-signed over a timestamp bound into the signed message
+  (`signing_message(ts, body)`), and the relay rejects any request whose timestamp is
+  outside a ±300 s window. A MITM therefore cannot forge a request, and a captured
+  signature is replayable only inside that window — and then only onto idempotent
+  operations (immutable-entry push, reads, guarded approve/revoke), so a replay changes
+  nothing. See `crypto-design.md` §"Relay request auth" for the exact envelope and the
+  idempotency argument.
 - **Stolen ciphertext at rest.** A dumped relay database or a stolen blob backup is
   inert without a device key or the recovery phrase. The local keyring is itself
   encrypted with an Argon2id-derived KEK, so a stolen laptop file (without the
@@ -33,6 +37,9 @@ non-secret routing metadata, and there is no server-side decryption path, ever.
 - **A malicious enrolled device.** Any approved device holds the vault key and can read
   and write every record. Enrollment approval is the trust decision; there is no
   intra-vault compartmentalization in v0.1 (team/multi-user vaults are out of scope).
+  The approver identifies the joining device by a 32-bit short code (see below), so the
+  approver must confirm that code out-of-band with the person operating the joining
+  device — approving the wrong device hands it the vault key.
 - **The recovery phrase.** Anyone who obtains the 24-word phrase can re-derive the vault
   key on a fresh machine and recover the entire vault. The phrase is a bearer secret;
   its protection is the user's responsibility.
@@ -41,6 +48,23 @@ non-secret routing metadata, and there is no server-side decryption path, ever.
 - **Availability.** A malicious or failed relay can withhold entries or refuse service.
   This is unavoidable for any sync server; sshvault stays offline-first so a missing
   relay never blocks local use, but it cannot force a hostile relay to deliver data.
+
+## Device short code (the approval handle)
+
+Approve/revoke name a device by a **32-bit** short code — the first 4 bytes of its
+Ed25519 public key. It is a convenience handle for the human approving a join, not a
+cryptographic identity:
+
+- **It is not the authenticator.** Approval wraps the vault key for the target's *full*
+  X25519 public key (bound to its full Ed25519 key via AAD); the 32-bit code only picks
+  which enrolled device that is. A device cannot forge a short code into someone else's
+  key material — at worst two devices share a code.
+- **Collisions are detected, not silently resolved.** If two devices share a code, the
+  approve/revoke call fails with `AmbiguousCode` rather than acting on the wrong one. So
+  the residual risk is confusion/denial (retry needed), not a silent wrong-device grant.
+- **Still verify out-of-band.** The code exists so two humans can confirm "the device I'm
+  approving is the device you're joining with." Approving a device you can't vouch for
+  hands it the whole vault (see "A malicious enrolled device" above).
 
 ## Device revocation semantics (read this carefully)
 
