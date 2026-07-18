@@ -21,8 +21,10 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          # Intel macOS is cross-compiled on the arm64 runner: the legacy
+          # macos-13 Intel runners are being retired and queue indefinitely.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable, pinned

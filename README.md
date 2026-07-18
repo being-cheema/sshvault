@@ -122,6 +122,11 @@ cargo test          # unit + property tests (10k cases/law) + integration gates
 cargo audit
 ```
 
+## Security
+
+Found a vulnerability? Please report it privately — see
+[SECURITY.md](SECURITY.md). Don't open a public issue for security bugs.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
