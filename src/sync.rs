@@ -165,7 +165,11 @@ pub async fn sync_once(v: &mut Vault) -> Result<(usize, usize), SyncError> {
 /// to (via `/v1/shares`). Returns `true` if the device *gained* a share it didn't
 /// hold before — the caller rewinds the pull cursor so previously-filtered
 /// entries get re-fetched. A no-op in the common already-current case.
-async fn heal_shares(client: &reqwest::Client, v: &mut Vault, relay: &str) -> Result<bool, SyncError> {
+async fn heal_shares(
+    client: &reqwest::Client,
+    v: &mut Vault,
+    relay: &str,
+) -> Result<bool, SyncError> {
     let mut gained = false;
 
     // Default share: rotation appends epochs; fetch our re-wrapped list if stale.

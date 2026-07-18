@@ -325,9 +325,11 @@ fn host_cmd(cmd: HostCmd) -> Result<()> {
         HostCmd::Add { alias, opts } => {
             let share = match &opts.share {
                 None => uuid::Uuid::nil(),
-                Some(name) => v
-                    .resolve_share(name)
-                    .with_context(|| format!("no share named '{name}' — create it with `sshvault share create {name}`"))?,
+                Some(name) => v.resolve_share(name).with_context(|| {
+                    format!(
+                        "no share named '{name}' — create it with `sshvault share create {name}`"
+                    )
+                })?,
             };
             let host = Host {
                 alias: alias.clone(),
@@ -734,8 +736,13 @@ fn share_cmd(cmd: ShareCmd) -> Result<()> {
     match cmd {
         ShareCmd::Create { name, members } => {
             let relay = require_relay(&v)?;
-            let id = rt.block_on(sshvault::device::create_share(&mut v, &relay, &name, &members))?;
-            println!("created share '{name}' ({id}) with {} member(s).", members.len());
+            let id = rt.block_on(sshvault::device::create_share(
+                &mut v, &relay, &name, &members,
+            ))?;
+            println!(
+                "created share '{name}' ({id}) with {} member(s).",
+                members.len()
+            );
             println!("Add hosts to it with `sshvault host add <alias> --share {name}`.");
             Ok(())
         }
@@ -766,7 +773,11 @@ fn share_cmd(cmd: ShareCmd) -> Result<()> {
                 println!("no named shares — everything is in the default (shared-with-all) share.");
             }
             for (name, id) in shares {
-                let member = if v.has_share(id) { "member" } else { "not a member" };
+                let member = if v.has_share(id) {
+                    "member"
+                } else {
+                    "not a member"
+                };
                 println!("  {name}  ({id})  {member}");
             }
             Ok(())
@@ -775,7 +786,8 @@ fn share_cmd(cmd: ShareCmd) -> Result<()> {
 }
 
 fn recover(relay: &str, device_name: &str) -> Result<()> {
-    let dir = sshvault::device::default_dir();    let relay = relay.trim_end_matches('/').to_string();
+    let dir = sshvault::device::default_dir();
+    let relay = relay.trim_end_matches('/').to_string();
     let phrase = rpassword::prompt_password("Enter your 24-word recovery phrase: ")
         .context("failed to read recovery phrase")?;
     let pass = prompt_new_passphrase()?;

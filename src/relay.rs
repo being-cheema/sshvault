@@ -558,13 +558,15 @@ async fn share_rotate(
         let target = B64
             .decode(pub_b64)
             .map_err(|_| (StatusCode::BAD_REQUEST, "remove pub".to_string()))?;
-        sqlx::query("DELETE FROM share_members WHERE vault_id = ? AND share_id = ? AND ed25519_pub = ?")
-            .bind(&vault)
-            .bind(&share)
-            .bind(&target)
-            .execute(&st.db)
-            .await
-            .map_err(db_err)?;
+        sqlx::query(
+            "DELETE FROM share_members WHERE vault_id = ? AND share_id = ? AND ed25519_pub = ?",
+        )
+        .bind(&vault)
+        .bind(&share)
+        .bind(&target)
+        .execute(&st.db)
+        .await
+        .map_err(db_err)?;
     }
     for w in &req.wrapped {
         let target = B64

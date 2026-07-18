@@ -714,11 +714,7 @@ impl Vault {
     /// key opens it (an entry for a share this device is not a member of), which
     /// is a legitimate skip, not corruption. `Err` only on a decrypt that opened
     /// but produced unparseable plaintext.
-    fn open_entry(
-        &self,
-        entry_id: &[u8; 16],
-        blob: &[u8],
-    ) -> Result<Option<Record>, VaultError> {
+    fn open_entry(&self, entry_id: &[u8; 16], blob: &[u8]) -> Result<Option<Record>, VaultError> {
         for share in &self.keyring.shares {
             for k in share.keys.iter().rev() {
                 let key = Zeroizing::new(*k);
@@ -1032,7 +1028,10 @@ fn split_key_list(list: &[u8]) -> Result<Vec<[u8; 32]>, VaultError> {
     if list.is_empty() || !list.len().is_multiple_of(32) {
         return Err(VaultError::Corrupt("malformed vault key list".into()));
     }
-    Ok(list.chunks_exact(32).map(|c| c.try_into().unwrap()).collect())
+    Ok(list
+        .chunks_exact(32)
+        .map(|c| c.try_into().unwrap())
+        .collect())
 }
 
 fn kind_str(kind: Kind) -> &'static str {

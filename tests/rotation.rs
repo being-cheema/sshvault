@@ -3,13 +3,13 @@
 //! over sync), while the revoked device is cut off AND the key material it still
 //! holds cannot decrypt anything written under the new epoch.
 
+use base64::Engine;
+use ed25519_dalek::Signer;
 use sshvault::crypto;
 use sshvault::record::Kind;
 use sshvault::vault::Vault;
-use base64::Engine;
-use ed25519_dalek::Signer;
-use uuid::Uuid;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 mod common;
 use common::{drain, host, hosts_sorted, start_relay};
@@ -59,7 +59,12 @@ async fn revoke_rotate_gives_forward_secrecy() {
 
     // Seed a pre-rotation record and converge everyone.
     devs[0]
-        .add(Kind::Host, "alias", "web", &host("web", "web.example.com", 22))
+        .add(
+            Kind::Host,
+            "alias",
+            "web",
+            &host("web", "web.example.com", 22),
+        )
         .unwrap();
     for _ in 0..2 {
         for d in devs.iter_mut() {
@@ -67,7 +72,11 @@ async fn revoke_rotate_gives_forward_secrecy() {
         }
     }
     for d in &devs {
-        assert_eq!(hosts_sorted(d).len(), 1, "everyone has the pre-rotation host");
+        assert_eq!(
+            hosts_sorted(d).len(),
+            1,
+            "everyone has the pre-rotation host"
+        );
     }
     assert_eq!(devs[0].epoch(), 0, "no rotation yet");
 
@@ -80,7 +89,12 @@ async fn revoke_rotate_gives_forward_secrecy() {
 
     // dev0 writes a NEW record under the new epoch and pushes it.
     devs[0]
-        .add(Kind::Host, "alias", "secret", &host("secret", "post.rotation", 22))
+        .add(
+            Kind::Host,
+            "alias",
+            "secret",
+            &host("secret", "post.rotation", 22),
+        )
         .unwrap();
     drain(&mut devs[0]).await;
 

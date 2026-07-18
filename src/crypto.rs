@@ -334,6 +334,9 @@ mod tests {
         assert_ne!(e0.as_ref(), e1.as_ref());
         assert_ne!(e1.as_ref(), e2.as_ref());
         // deterministic per epoch
-        assert_eq!(e1.as_ref(), vault_key_at_epoch(&phrase, 1).unwrap().as_ref());
+        assert_eq!(
+            e1.as_ref(),
+            vault_key_at_epoch(&phrase, 1).unwrap().as_ref()
+        );
     }
 }

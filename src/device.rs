@@ -355,7 +355,10 @@ pub async fn share_remove(
         remove: vec![target.ed25519_pub_b64.clone()],
     };
     let client = sync::http_client();
-    let signed = sync::sign(v, serde_json::to_string(&req).expect("share rotate serializes"));
+    let signed = sync::sign(
+        v,
+        serde_json::to_string(&req).expect("share rotate serializes"),
+    );
     let _: crate::proto::PushResp =
         sync::post(&client, format!("{relay}/v1/share/rotate"), &signed).await?;
     Ok(target.name)

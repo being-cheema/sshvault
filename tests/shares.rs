@@ -34,7 +34,12 @@ async fn shares_compartmentalize_and_rotate_on_removal() {
 
     // A default-share host reaches everyone (backward-compat baseline).
     devs[0]
-        .add(Kind::Host, "alias", "public", &host("public", "public.example", 22))
+        .add(
+            Kind::Host,
+            "alias",
+            "public",
+            &host("public", "public.example", 22),
+        )
         .unwrap();
 
     // dev0 creates a share with dev1 and puts a secret host in it.
@@ -67,7 +72,10 @@ async fn shares_compartmentalize_and_rotate_on_removal() {
         );
     }
     // dev0 and dev1 (members) see the secret; dev2 (outsider) does not.
-    assert!(hosts(&devs[0]).iter().any(|h| h.alias == "secret"), "creator sees secret");
+    assert!(
+        hosts(&devs[0]).iter().any(|h| h.alias == "secret"),
+        "creator sees secret"
+    );
     assert!(devs[1].has_share(share), "dev1 became a member");
     assert!(
         hosts(&devs[1]).iter().any(|h| h.alias == "secret"),
@@ -110,8 +118,14 @@ async fn shares_compartmentalize_and_rotate_on_removal() {
 
     // dev0 still reads both share hosts.
     let h0 = hosts(&devs[0]);
-    assert!(h0.iter().any(|h| h.alias == "secret"), "creator keeps old share host");
-    assert!(h0.iter().any(|h| h.alias == "secret2"), "creator reads post-rotation host");
+    assert!(
+        h0.iter().any(|h| h.alias == "secret"),
+        "creator keeps old share host"
+    );
+    assert!(
+        h0.iter().any(|h| h.alias == "secret2"),
+        "creator reads post-rotation host"
+    );
 
     // dev1 was removed: it must NOT gain the post-rotation host. (It may still
     // hold the pre-rotation secret it already pulled — rotation is forward-only.)
