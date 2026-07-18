@@ -23,6 +23,10 @@ pub enum Kind {
     Snippet,
     PortForward,
     KeyMeta,
+    /// Maps a share's human name to its id, so every default-share member can
+    /// address a share by name. Names aren't secret (membership is), so this
+    /// lives in the default share. Never rendered to ssh_config.
+    ShareName,
 }
 
 /// One field of a record with the clock of its last write.
@@ -48,6 +52,12 @@ pub struct Record {
     pub device_id: Uuid,
     /// Unix seconds; informational only — never used for merge decisions.
     pub modified_at: u64,
+    /// Which share (compartment) this record lives in. Nil = the default share
+    /// every member holds. A record is sealed under its share's key; a device
+    /// not in the share cannot decrypt it. Defaults to nil so pre-share records
+    /// and single-user vaults need no migration.
+    #[serde(default)]
+    pub share_id: Uuid,
 }
 
 impl Record {
@@ -148,6 +158,14 @@ pub struct KeyMeta {
     pub hosts: Vec<String>,
 }
 
+/// Maps a share's human name to its 16-byte id (base64). Lives in the default
+/// share so every member can resolve a share name to its id locally.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShareName {
+    pub name: String,
+    pub share_id_b64: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +197,7 @@ mod tests {
             clock: clock(1),
             device_id: Uuid::nil(),
             modified_at: 0,
+            share_id: Uuid::nil(),
         };
         assert_eq!(rec.payload::<Host>().unwrap(), host);
     }
@@ -200,6 +219,7 @@ mod tests {
             clock: clock(5),
             device_id: Uuid::nil(),
             modified_at: 0,
+            share_id: Uuid::nil(),
         };
         assert!(!rec.is_deleted(), "older tombstone loses to newer edit");
         rec.deleted_at = Some(clock(6));
@@ -224,6 +244,7 @@ mod tests {
             clock: clock(9),
             device_id: Uuid::new_v4(),
             modified_at: 1234,
+            share_id: Uuid::nil(),
         };
         let bytes = rmp_serde::to_vec_named(&rec).unwrap();
         let back: Record = rmp_serde::from_slice(&bytes).unwrap();

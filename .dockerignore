@@ -1,0 +1,12 @@
+target/
+.git/
+.github/
+.claude/
+docs/
+*.md
+*.db
+*.db-shm
+*.db-wal
+Dockerfile
+docker-compose.yml
+.dockerignore

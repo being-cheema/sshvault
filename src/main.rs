@@ -77,6 +77,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DeviceCmd,
     },
+    /// Manage shares (compartments): named subsets of records visible only to
+    /// their members. Records not in a share live in the default share everyone
+    /// sees.
+    Share {
+        #[command(subcommand)]
+        cmd: ShareCmd,
+    },
     /// Recover a vault on this machine from your 24-word recovery phrase
     Recover {
         /// Relay URL the vault syncs with
@@ -106,8 +113,41 @@ enum DeviceCmd {
     Approve { code: String },
     /// List devices enrolled in your vault
     List,
-    /// Revoke a device by its short code (it can no longer sync or re-enroll)
-    Revoke { code: String },
+    /// Revoke a device by its short code (it can no longer sync or re-enroll).
+    /// With --rotate, also rotate the vault key so the revoked device cannot read
+    /// data written after this point (requires your recovery phrase).
+    Revoke {
+        code: String,
+        /// Rotate the vault key for forward secrecy (prompts for recovery phrase)
+        #[arg(long)]
+        rotate: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ShareCmd {
+    /// Create a share and grant it to the given device short codes
+    Create {
+        /// Human name for the share
+        name: String,
+        /// Device short code to add as a member (repeatable)
+        #[arg(long = "member")]
+        members: Vec<String>,
+    },
+    /// Add members (device short codes) to an existing share
+    Add {
+        name: String,
+        #[arg(long = "member")]
+        members: Vec<String>,
+    },
+    /// Remove a member from a share and rotate its key (forward secrecy)
+    Remove {
+        name: String,
+        /// Device short code to remove
+        code: String,
+    },
+    /// List shares known to this device and whether you're a member
+    List,
 }
 
 #[derive(Subcommand)]
@@ -148,6 +188,10 @@ struct HostOpts {
     /// Tag (repeatable); on edit, replaces all tags
     #[arg(long = "tag")]
     tags: Vec<String>,
+    /// Place this host in a named share (only its members can see it). Default:
+    /// the shared-with-everyone default share. Ignored on edit.
+    #[arg(long)]
+    share: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -256,6 +300,7 @@ fn run() -> Result<()> {
         Cmd::Syncd { apply } => syncd(apply),
         Cmd::Serve { addr, db } => serve(&addr, &db),
         Cmd::Device { cmd } => device_cmd(cmd),
+        Cmd::Share { cmd } => share_cmd(cmd),
         Cmd::Recover { relay, device_name } => recover(&relay, &device_name),
     }
 }
@@ -278,6 +323,12 @@ fn host_cmd(cmd: HostCmd) -> Result<()> {
     let mut v = open_vault()?;
     match cmd {
         HostCmd::Add { alias, opts } => {
+            let share = match &opts.share {
+                None => uuid::Uuid::nil(),
+                Some(name) => v
+                    .resolve_share(name)
+                    .with_context(|| format!("no share named '{name}' — create it with `sshvault share create {name}`"))?,
+            };
             let host = Host {
                 alias: alias.clone(),
                 hostname: opts.hostname,
@@ -287,7 +338,7 @@ fn host_cmd(cmd: HostCmd) -> Result<()> {
                 identity_file: opts.identity,
                 tags: opts.tags,
             };
-            v.add(Kind::Host, "alias", &alias, &host)?;
+            v.add_in(Kind::Host, "alias", &alias, &host, share)?;
             println!("added host '{alias}' — run `sshvault apply` to update ssh config");
         }
         HostCmd::Edit { alias, opts } => {
@@ -648,19 +699,83 @@ fn device_cmd(cmd: DeviceCmd) -> Result<()> {
             }
             Ok(())
         }
-        DeviceCmd::Revoke { code } => {
-            let v = open_vault()?;
+        DeviceCmd::Revoke { code, rotate } => {
+            let mut v = open_vault()?;
             let relay = require_relay(&v)?;
-            let name = rt.block_on(sshvault::device::revoke(&v, &relay, &code))?;
-            println!("revoked '{name}' ({code}) — it can no longer sync or re-enroll.");
+            if rotate {
+                let phrase = rpassword::prompt_password("Enter your 24-word recovery phrase: ")
+                    .context("failed to read recovery phrase")?;
+                let name = rt.block_on(sshvault::device::revoke_and_rotate(
+                    &mut v,
+                    &relay,
+                    &code,
+                    phrase.trim(),
+                ))?;
+                println!(
+                    "revoked '{name}' ({code}) and rotated the vault key — it can no longer sync, \
+                     and cannot read data written from now on."
+                );
+                println!("Run `sshvault sync` on your other devices to pick up the new key.");
+            } else {
+                let name = rt.block_on(sshvault::device::revoke(&v, &relay, &code))?;
+                println!("revoked '{name}' ({code}) — it can no longer sync or re-enroll.");
+                println!(
+                    "note: it still holds the current vault key. Use `--rotate` for forward secrecy."
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn share_cmd(cmd: ShareCmd) -> Result<()> {
+    let mut v = open_vault()?;
+    let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
+    match cmd {
+        ShareCmd::Create { name, members } => {
+            let relay = require_relay(&v)?;
+            let id = rt.block_on(sshvault::device::create_share(&mut v, &relay, &name, &members))?;
+            println!("created share '{name}' ({id}) with {} member(s).", members.len());
+            println!("Add hosts to it with `sshvault host add <alias> --share {name}`.");
+            Ok(())
+        }
+        ShareCmd::Add { name, members } => {
+            let relay = require_relay(&v)?;
+            let id = v
+                .resolve_share(&name)
+                .with_context(|| format!("no share named '{name}'"))?;
+            rt.block_on(sshvault::device::share_add(&v, &relay, id, &members))?;
+            println!("granted '{name}' to {} member(s).", members.len());
+            Ok(())
+        }
+        ShareCmd::Remove { name, code } => {
+            let relay = require_relay(&v)?;
+            let id = v
+                .resolve_share(&name)
+                .with_context(|| format!("no share named '{name}'"))?;
+            let who = rt.block_on(sshvault::device::share_remove(&mut v, &relay, id, &code))?;
+            println!(
+                "removed '{who}' ({code}) from share '{name}' and rotated its key — \
+                 it can no longer read data written to '{name}' from now on."
+            );
+            Ok(())
+        }
+        ShareCmd::List => {
+            let shares = v.share_names();
+            if shares.is_empty() {
+                println!("no named shares — everything is in the default (shared-with-all) share.");
+            }
+            for (name, id) in shares {
+                let member = if v.has_share(id) { "member" } else { "not a member" };
+                println!("  {name}  ({id})  {member}");
+            }
             Ok(())
         }
     }
 }
 
 fn recover(relay: &str, device_name: &str) -> Result<()> {
-    let dir = sshvault::device::default_dir();
-    let relay = relay.trim_end_matches('/').to_string();
+    let dir = sshvault::device::default_dir();    let relay = relay.trim_end_matches('/').to_string();
     let phrase = rpassword::prompt_password("Enter your 24-word recovery phrase: ")
         .context("failed to read recovery phrase")?;
     let pass = prompt_new_passphrase()?;

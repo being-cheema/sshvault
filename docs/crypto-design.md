@@ -38,8 +38,8 @@ BIP39 mnemonic (24 words, 256-bit entropy)         generated once at `init`
         └── HKDF-SHA256(seed, info="sshvault/v1/recovery-auth") → Ed25519 recovery keypair
 ```
 
-- **VK** encrypts every record. Same VK for the life of the vault (v0.1; rotation is
-  the v0.2 extension point).
+- **VK** encrypts every record. Epoch 0 is the original key; `revoke --rotate` mints
+  later epochs (see §"Vault key epochs").
 - **Recovery keypair**: public half registered with the relay at vault creation; a
   fresh machine holding the phrase can re-derive it, sign an enrollment request, and
   be auto-approved (`sshvault recover`). The relay never sees the seed or VK.
@@ -135,7 +135,71 @@ wrapped        = eph_pub || nonce || XChaCha20-Poly1305_wrap_key(VK, aad = recip
 
 Recipient unwraps with `X25519(device_secret, eph_pub)`. Binding both public keys in
 the HKDF info and the recipient device id in the AAD prevents cross-device replay of
-wrapped keys.
+wrapped keys. The wrapped payload is the vault key (enrollment) or, after any rotation,
+the whole epoch key-list (see below) — the wrap construction is payload-length-agnostic.
+
+## Vault key epochs (rotation)
+
+`revoke --rotate` gives forward secrecy by rotating VK. VK is not a single key but an
+**epoch-indexed list**; the newest epoch encrypts new writes, older epochs stay in the
+list so pre-rotation entries still decrypt.
+
+```
+VK_0 = HKDF-SHA256(seed, info = "sshvault/v1/vault-key")        // == the original key
+VK_n = HKDF-SHA256(seed, info = "sshvault/v1/vault-key/{n}")    // n ≥ 1, minted on rotate
+```
+
+- **Epoch 0 is byte-identical to the pre-rotation derivation.** A vault that never
+  rotates is exactly an epoch-0 vault; no migration, no format change.
+- **Rotation is phrase-gated.** `VK_n` is derived from the BIP39 seed, so only the
+  recovery-phrase holder can mint a new epoch. This is why `revoke --rotate` prompts for
+  the phrase. It keeps the relay VK-free (direct-derivation property, above) across
+  rotations: recovery from the phrase alone still reaches *every* epoch.
+- **No epoch tag on the wire or on disk.** A log entry carries no epoch marker; the
+  reader trial-decrypts newest-epoch-first until the AEAD tag verifies (unambiguous at
+  2^-128). So `WireEntry`, the relay `entries` table, and the on-disk log frame are all
+  unchanged by rotation — the cost is at most (#epochs) trial-opens per entry on replay.
+- **AAD is still just `entry_id`.** The key *is* the epoch selector; adding the epoch to
+  the AAD would buy nothing (an attacker without a key cannot forge ciphertext under any
+  epoch), so the record AEAD is unchanged.
+- **Re-wrapping.** On rotate, the rotating device wraps the new epoch key-list (via the
+  `wrap_vault_key` path above) for every *remaining* device and hands the relay the epoch
+  bump + per-device wrapped blobs in one signed `/v1/rotate` call. Offline devices
+  self-heal: each sync round first fetches its wrapped list from the signed
+  `/v1/wrapped` endpoint and absorbs it if the relay epoch is ahead, before pulling
+  new-epoch entries. History is never re-encrypted (see threat-model.md for why).
+
+## Shares (compartments)
+
+A **share** is a subset of records under its own key-list, readable only by its member
+devices. Every record carries a `share_id` (nil = the default share, held by all
+approved devices). Shares reuse the epoch machinery above verbatim — a share is just
+another keyed container that can rotate:
+
+- **The vault holds a per-share key-list**, keyed by 16-byte share id. Sealing a record
+  uses its share's newest-epoch key; on replay a device trial-decrypts across *every*
+  share key it holds (newest epoch first). An entry in a share the device isn't a member
+  of simply doesn't open and is skipped — retained as ciphertext so a later grant + replay
+  can read it, but never merged into state meanwhile.
+- **Default share = phrase-derived; named shares = random.** The default share's keys are
+  `VK_n` above (phrase-derived, so it's fully phrase-recoverable). A **named** share's keys
+  are random 32-byte keys, *not* derived from the seed. This is forced, not chosen: any
+  member must be able to rotate a named share when a member is removed, and members don't
+  hold the recovery seed. The consequence is that phrase-only recovery restores the default
+  share alone; named shares are re-granted by a remaining member (threat-model.md).
+- **Granting** wraps the share's key-list for each new member via the same `wrap_vault_key`
+  path (`POST /v1/share/grant`); the relay stores membership + opaque wrapped blobs and
+  enforces no policy — holding the key *is* the authorization ("any member manages"). A
+  caller who doesn't actually hold the share key can only store a wrap the target can't
+  open, which grants nothing.
+- **Removal rotates.** `share remove` mints a fresh random next-epoch key, re-wraps it for
+  every *remaining* member, and drops the removed member's membership row
+  (`POST /v1/share/rotate`, seen-sig gated + guarded epoch bump exactly like `/v1/rotate`).
+  Forward-only: the removed device keeps whatever it already pulled.
+- **The relay filters pull by membership** (an entry reaches a device iff its share is nil
+  or the device has a membership row) as a routing optimization; the key, not the filter,
+  is the security boundary. This is the one new metadata surface shares add — see
+  threat-model.md "Share shape".
 
 ## Relay request auth
 
@@ -178,9 +242,15 @@ Ed25519 device key with the recovery key. Replaying that request only re-admits
 the same device key its author already controls — no timestamp is needed to make
 it safe.
 
-<!-- ponytail: no per-request nonce cache; the ±300 s window + idempotency is the
-     v0.1 replay story. Add a seen-signature cache if any non-idempotent
-     authenticated endpoint is ever introduced. -->
+**Seen-signature cache.** `/v1/rotate` is the first (and, until team vaults, only)
+authenticated endpoint with a *non-idempotent* side effect — it advances an epoch
+counter. The ±300 s window alone would let a captured rotate envelope be replayed once
+more inside the window, so the relay keeps a persisted `seen_sigs(sig, expires_at)`
+table (SQLite, so it survives restarts — a restart must not reopen the window) keyed on
+the raw 64-byte signature, entries expiring after `MAX_SKEW_SECS`. `/v1/rotate` inserts
+its signature and rejects a duplicate with 409. The epoch bump is *also* guarded
+(`UPDATE … WHERE epoch = n-1`) so even a cache bypass can't double-advance. Idempotent
+endpoints (push/pull/approve/revoke/reads) are not gated — they don't need it.
 
 ## Device short code (out-of-band verification)
 

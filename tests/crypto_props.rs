@@ -42,9 +42,9 @@ proptest! {
     fn vault_key_wrap_round_trip(vk in key_strategy(), device_id in proptest::collection::vec(any::<u8>(), 1..32)) {
         let dev = crypto::new_device_keys();
         let dev_pub = x25519_dalek::PublicKey::from(&dev.x25519);
-        let wrapped = crypto::wrap_vault_key(&vk, &dev_pub, &device_id);
+        let wrapped = crypto::wrap_vault_key(vk.as_ref(), &dev_pub, &device_id);
         let unwrapped = crypto::unwrap_vault_key(&dev.x25519, &wrapped, &device_id).expect("unwrap");
-        prop_assert_eq!(unwrapped.as_ref(), vk.as_ref());
+        prop_assert_eq!(unwrapped.as_slice(), vk.as_ref());
 
         let mut other_id = device_id.clone();
         other_id[0] ^= 1;

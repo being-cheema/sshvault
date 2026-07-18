@@ -34,6 +34,9 @@ pub fn merge(a: &Record, b: &Record) -> Record {
         clock: newer.clock,
         device_id: newer.device_id,
         modified_at: newer.modified_at.max(older.modified_at),
+        // A record's share is fixed at creation; both snapshots agree. Take the
+        // newer's to stay deterministic if a buggy writer ever diverged.
+        share_id: newer.share_id,
     }
 }
 
@@ -86,6 +89,7 @@ mod tests {
             clock: c,
             device_id: c.device,
             modified_at: c.lamport,
+            share_id: Uuid::nil(),
         }
     }
 
@@ -98,6 +102,7 @@ mod tests {
             clock: c,
             device_id: c.device,
             modified_at: c.lamport,
+            share_id: Uuid::nil(),
         }
     }
 

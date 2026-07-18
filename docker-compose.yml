@@ -1,0 +1,11 @@
+services:
+  relay:
+    build: .
+    ports:
+      - "8787:8787"
+    volumes:
+      - relay-data:/data
+    restart: unless-stopped
+
+volumes:
+  relay-data:

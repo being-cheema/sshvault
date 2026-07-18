@@ -9,6 +9,7 @@ use crate::crypto;
 use crate::proto::{
     ApproveReq, DeviceInfo, DevicesResp, RecoverReq, RecoverResp, RevokeReq, WrappedResp,
 };
+use crate::record::Kind;
 use crate::sync::{self, SyncError, B64};
 use crate::vault::{self, Vault, VaultError};
 use base64::Engine;
@@ -75,9 +76,9 @@ pub async fn enroll_and_wait(
             let wrapped = B64
                 .decode(&wrapped_b64)
                 .map_err(|_| sync::bad("wrapped_key"))?;
-            let vk = crypto::unwrap_vault_key(&v.x25519_secret(), &wrapped, &v.ed25519_pub())
+            let key_list = crypto::unwrap_vault_key(&v.x25519_secret(), &wrapped, &v.ed25519_pub())
                 .map_err(VaultError::from)?;
-            v.set_vault_key(&vk, passphrase)?;
+            v.set_vault_key(&key_list)?;
             return Ok(v);
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -124,8 +125,10 @@ pub async fn approve(v: &Vault, relay: &str, code: &str) -> Result<String, Enrol
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| sync::bad("ed25519_pub"))?;
-    let vk = v.vault_key();
-    let wrapped = crypto::wrap_vault_key(&vk, &x_pub, &target_ed);
+    // Wrap the whole epoch key-list so the joiner can read entries from every
+    // epoch, not just the current one.
+    let key_list = v.vault_key_list();
+    let wrapped = crypto::wrap_vault_key(&key_list, &x_pub, &target_ed);
     let req = ApproveReq {
         target_pub_b64: target.ed25519_pub_b64.clone(),
         wrapped_key_b64: B64.encode(&wrapped),
@@ -137,7 +140,10 @@ pub async fn approve(v: &Vault, relay: &str, code: &str) -> Result<String, Enrol
     Ok(target.name)
 }
 
-/// Revoke a device by short code. After this it cannot sync or re-enroll.
+/// Revoke a device by short code. After this it cannot sync or re-enroll. This
+/// is access-control only — it does NOT rotate the vault key, so the revoked
+/// device still holds the key and can read anything it already pulled. For
+/// forward secrecy use [`revoke_and_rotate`].
 pub async fn revoke(v: &Vault, relay: &str, code: &str) -> Result<String, EnrollError> {
     let target = find_by_code(v, relay, code).await?;
     let req = RevokeReq {
@@ -148,6 +154,226 @@ pub async fn revoke(v: &Vault, relay: &str, code: &str) -> Result<String, Enroll
     let _: crate::proto::PushResp =
         sync::post(&client, format!("{relay}/v1/revoke"), &signed).await?;
     Ok(target.name)
+}
+
+/// Revoke a device AND rotate the vault key so the revoked device cannot read
+/// data written after this point (forward secrecy). Requires the recovery phrase
+/// — the new epoch key is derived from the seed, which only the phrase holder
+/// has. Steps: revoke the target, mint the next epoch locally, re-wrap the new
+/// epoch key-list for every *remaining* non-revoked device, and hand the relay
+/// the bump + the per-device wrapped lists in one signed call.
+///
+/// Cannot recover plaintext the revoked device already pulled (see
+/// threat-model.md); it closes the going-forward gap only.
+pub async fn revoke_and_rotate(
+    v: &mut Vault,
+    relay: &str,
+    code: &str,
+    phrase: &str,
+) -> Result<String, EnrollError> {
+    let target = find_by_code(v, relay, code).await?;
+    // 1. Revoke first, so the target is already gone from the device list we
+    //    re-wrap for even if it races an enroll.
+    let name = revoke(v, relay, code).await?;
+
+    // 2. Mint the next epoch locally (phrase-gated) and seal future writes under it.
+    let epoch = v.rotate(phrase)?;
+    let key_list = v.vault_key_list();
+
+    // 3. Re-wrap the new key-list for every remaining approved/pending device
+    //    except the one we just revoked.
+    let devices = list_devices(v, relay).await?;
+    let mut wrapped = Vec::new();
+    for d in &devices {
+        if d.revoked || d.ed25519_pub_b64 == target.ed25519_pub_b64 {
+            continue;
+        }
+        let x_pub_bytes: [u8; 32] = B64
+            .decode(&d.x25519_pub_b64)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| sync::bad("x25519_pub"))?;
+        let ed: [u8; 32] = B64
+            .decode(&d.ed25519_pub_b64)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| sync::bad("ed25519_pub"))?;
+        let x_pub = x25519_dalek::PublicKey::from(x_pub_bytes);
+        wrapped.push(crate::proto::WrappedFor {
+            device_pub_b64: d.ed25519_pub_b64.clone(),
+            wrapped_key_b64: B64.encode(crypto::wrap_vault_key(&key_list, &x_pub, &ed)),
+        });
+    }
+
+    // 4. Hand the relay the epoch bump + re-wrapped lists in one signed call.
+    let req = crate::proto::RotateReq { epoch, wrapped };
+    let client = sync::http_client();
+    let signed = sync::sign(v, serde_json::to_string(&req).expect("rotate serializes"));
+    let _: crate::proto::PushResp =
+        sync::post(&client, format!("{relay}/v1/rotate"), &signed).await?;
+    Ok(name)
+}
+
+// ---- shares -----------------------------------------------------------------
+
+/// Wrap `key_list` for each named device (by short code), returning the
+/// `WrappedFor` blobs. Errors if a code matches no or many devices.
+async fn wrap_for_codes(
+    v: &Vault,
+    relay: &str,
+    key_list: &[u8],
+    codes: &[String],
+) -> Result<Vec<crate::proto::WrappedFor>, EnrollError> {
+    let mut out = Vec::new();
+    for code in codes {
+        let d = find_by_code(v, relay, code).await?;
+        let x_pub_bytes: [u8; 32] = B64
+            .decode(&d.x25519_pub_b64)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| sync::bad("x25519_pub"))?;
+        let ed: [u8; 32] = B64
+            .decode(&d.ed25519_pub_b64)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| sync::bad("ed25519_pub"))?;
+        let x_pub = x25519_dalek::PublicKey::from(x_pub_bytes);
+        out.push(crate::proto::WrappedFor {
+            device_pub_b64: d.ed25519_pub_b64.clone(),
+            wrapped_key_b64: B64.encode(crypto::wrap_vault_key(key_list, &x_pub, &ed)),
+        });
+    }
+    Ok(out)
+}
+
+/// Create a new share locally and grant it to `member_codes` (plus this device,
+/// so every device you own can read it). `name` is recorded in the default share
+/// so all members can address the share by name. Returns the new share id.
+pub async fn create_share(
+    v: &mut Vault,
+    relay: &str,
+    name: &str,
+    member_codes: &[String],
+) -> Result<Uuid, EnrollError> {
+    if v.resolve_share(name).is_some() {
+        return Err(EnrollError::Vault(VaultError::Duplicate {
+            kind: "share",
+            name: name.into(),
+        }));
+    }
+    let share = v.create_share()?;
+    // Record name→id in the default share so it syncs to every member.
+    v.add(
+        Kind::ShareName,
+        "name",
+        name,
+        &crate::record::ShareName {
+            name: name.into(),
+            share_id_b64: B64.encode(share.as_bytes()),
+        },
+    )?;
+    let key_list = v.share_key_list_for(share);
+    // Grant to the named members AND to this device (self), so its own future
+    // syncs on other machines re-learn the share via /v1/shares.
+    let mut wrapped = wrap_for_codes(v, relay, &key_list, member_codes).await?;
+    let self_code = short_code(&v.meta.ed25519_pub_b64);
+    wrapped.extend(wrap_for_codes(v, relay, &key_list, std::slice::from_ref(&self_code)).await?);
+    let req = crate::proto::ShareGrantReq {
+        share_id_b64: B64.encode(share.as_bytes()),
+        epoch: v.share_epoch_for(share),
+        wrapped,
+    };
+    let client = sync::http_client();
+    let signed = sync::sign(v, serde_json::to_string(&req).expect("grant serializes"));
+    let _: crate::proto::PushResp =
+        sync::post(&client, format!("{relay}/v1/share/grant"), &signed).await?;
+    Ok(share)
+}
+
+/// Add members to an existing share you hold: wrap the current key-list for each
+/// and grant.
+pub async fn share_add(
+    v: &Vault,
+    relay: &str,
+    share: Uuid,
+    member_codes: &[String],
+) -> Result<(), EnrollError> {
+    if !v.has_share(share) {
+        return Err(EnrollError::Vault(VaultError::Corrupt(
+            "you are not a member of this share".into(),
+        )));
+    }
+    let key_list = v.share_key_list_for(share);
+    let wrapped = wrap_for_codes(v, relay, &key_list, member_codes).await?;
+    let req = crate::proto::ShareGrantReq {
+        share_id_b64: B64.encode(share.as_bytes()),
+        epoch: v.share_epoch_for(share),
+        wrapped,
+    };
+    let client = sync::http_client();
+    let signed = sync::sign(v, serde_json::to_string(&req).expect("grant serializes"));
+    let _: crate::proto::PushResp =
+        sync::post(&client, format!("{relay}/v1/share/grant"), &signed).await?;
+    Ok(())
+}
+
+/// Remove a member from a share and rotate its key so the removed device can't
+/// read data written afterward. Named-share rotation uses a fresh RANDOM key
+/// (members lack the recovery seed), unlike the phrase-gated default share.
+pub async fn share_remove(
+    v: &mut Vault,
+    relay: &str,
+    share: Uuid,
+    member_code: &str,
+) -> Result<String, EnrollError> {
+    if !v.has_share(share) {
+        return Err(EnrollError::Vault(VaultError::Corrupt(
+            "you are not a member of this share".into(),
+        )));
+    }
+    let target = find_by_code(v, relay, member_code).await?;
+
+    // Mint the new random epoch locally, then re-wrap for every remaining member.
+    let epoch = v.rotate_share(share)?;
+    let key_list = v.share_key_list_for(share);
+
+    // Who are the remaining members? Ask the relay for current membership.
+    let members = share_members(v, relay, share).await?;
+    let mut wrapped = Vec::new();
+    for ed_b64 in &members {
+        if *ed_b64 == target.ed25519_pub_b64 {
+            continue; // the one being removed
+        }
+        // Look the device up to get its X25519 key.
+        let code = short_code(ed_b64);
+        wrapped.extend(wrap_for_codes(v, relay, &key_list, std::slice::from_ref(&code)).await?);
+    }
+    let req = crate::proto::ShareRotateReq {
+        share_id_b64: B64.encode(share.as_bytes()),
+        epoch,
+        wrapped,
+        remove: vec![target.ed25519_pub_b64.clone()],
+    };
+    let client = sync::http_client();
+    let signed = sync::sign(v, serde_json::to_string(&req).expect("share rotate serializes"));
+    let _: crate::proto::PushResp =
+        sync::post(&client, format!("{relay}/v1/share/rotate"), &signed).await?;
+    Ok(target.name)
+}
+
+/// The Ed25519 pubs (base64) to re-wrap a rotated share for. Rotation UPDATEs
+/// only existing members on the relay, so re-wrapping for every approved device
+/// is safe — a wrap for a non-member updates zero rows. We therefore don't need
+/// the exact member set here.
+/// ponytail: re-wrap for all approved devices; tighten to exact membership only
+/// if a per-share member-list endpoint is ever added.
+async fn share_members(v: &Vault, relay: &str, _share: Uuid) -> Result<Vec<String>, EnrollError> {
+    let devices = list_devices(v, relay).await?;
+    Ok(devices
+        .into_iter()
+        .filter(|d| d.approved && !d.revoked)
+        .map(|d| d.ed25519_pub_b64)
+        .collect())
 }
 
 /// Recover a vault on a fresh machine from its recovery phrase. Re-derives the

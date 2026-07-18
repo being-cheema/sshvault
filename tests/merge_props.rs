@@ -78,6 +78,7 @@ fn any_record() -> impl Strategy<Value = Record> {
                 clock: hclock,
                 device_id: hclock.device,
                 modified_at: hclock.lamport,
+                share_id: uuid::Uuid::nil(),
             }
         })
 }
@@ -143,6 +144,7 @@ proptest! {
             clock: tclock,
             device_id: tclock.device,
             modified_at: tclock.lamport,
+            share_id: uuid::Uuid::nil(),
         };
         let mut all = es;
         all.push(tomb);

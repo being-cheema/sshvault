@@ -59,13 +59,12 @@ pub fn new_phrase() -> (String, PhraseKeys) {
     (phrase, keys)
 }
 
-/// Re-derive the vault key and recovery keypair from a recovery phrase.
+/// Re-derive the epoch-0 vault key and recovery keypair from a recovery phrase.
 pub fn keys_from_phrase(phrase: &str) -> Result<PhraseKeys, CryptoError> {
-    let mnemonic = Mnemonic::parse_normalized(phrase.trim()).map_err(|_| CryptoError::BadPhrase)?;
-    let seed = Zeroizing::new(mnemonic.to_seed(""));
+    let seed = seed_from_phrase(phrase)?;
     let hk = Hkdf::<Sha256>::new(None, seed.as_ref());
     let mut vk = Zeroizing::new([0u8; 32]);
-    hk.expand(b"sshvault/v1/vault-key", vk.as_mut())
+    hk.expand(vault_key_info(0).as_bytes(), vk.as_mut())
         .map_err(|_| CryptoError::Kdf)?;
     let mut rk = Zeroizing::new([0u8; 32]);
     hk.expand(b"sshvault/v1/recovery-auth", rk.as_mut())
@@ -74,6 +73,36 @@ pub fn keys_from_phrase(phrase: &str) -> Result<PhraseKeys, CryptoError> {
         vault_key: vk,
         recovery_signing: SigningKey::from_bytes(&rk),
     })
+}
+
+/// Re-derive the vault key for a given rotation epoch from the recovery phrase.
+/// Epoch 0 is the original key (unchanged info string, so old vaults stay
+/// byte-compatible); each rotation derives the next epoch's key from the same
+/// seed. Rotation is therefore phrase-gated: without the phrase there is no seed
+/// and no way to mint a new epoch.
+pub fn vault_key_at_epoch(phrase: &str, epoch: u32) -> Result<Secret32, CryptoError> {
+    let seed = seed_from_phrase(phrase)?;
+    let hk = Hkdf::<Sha256>::new(None, seed.as_ref());
+    let mut vk = Zeroizing::new([0u8; 32]);
+    hk.expand(vault_key_info(epoch).as_bytes(), vk.as_mut())
+        .map_err(|_| CryptoError::Kdf)?;
+    Ok(vk)
+}
+
+fn seed_from_phrase(phrase: &str) -> Result<Zeroizing<[u8; 64]>, CryptoError> {
+    let mnemonic = Mnemonic::parse_normalized(phrase.trim()).map_err(|_| CryptoError::BadPhrase)?;
+    Ok(Zeroizing::new(mnemonic.to_seed("")))
+}
+
+/// HKDF info string for an epoch's vault key. Epoch 0 keeps the original string
+/// verbatim — that byte-for-byte match is what makes pre-rotation vaults valid
+/// epoch-0 vaults with no migration.
+fn vault_key_info(epoch: u32) -> String {
+    if epoch == 0 {
+        "sshvault/v1/vault-key".to_string()
+    } else {
+        format!("sshvault/v1/vault-key/{epoch}")
+    }
 }
 
 /// Derive the keyring-encryption key (KEK) from a passphrase with Argon2id.
@@ -130,11 +159,12 @@ pub fn open(key: &Secret32, blob: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>
         .map_err(|_| CryptoError::Decrypt)
 }
 
-/// Wrap the vault key for a recipient device: ephemeral-static X25519 +
+/// Wrap arbitrary secret bytes for a recipient device: ephemeral-static X25519 +
 /// HKDF-SHA256 + XChaCha20-Poly1305 (sealed-box construction, see
 /// crypto-design.md). Output layout: `eph_pub(32) || nonce(24) || ciphertext+tag`.
+/// The payload is the vault key (v0.1) or the full epoch key-list (rotation).
 pub fn wrap_vault_key(
-    vault_key: &Secret32,
+    payload: &[u8],
     recipient_pub: &x25519_dalek::PublicKey,
     recipient_device_id: &[u8],
 ) -> Vec<u8> {
@@ -146,19 +176,20 @@ pub fn wrap_vault_key(
         eph_pub.as_bytes(),
         recipient_pub.as_bytes(),
     );
-    let sealed = seal(&wrap_key, vault_key.as_ref(), recipient_device_id);
+    let sealed = seal(&wrap_key, payload, recipient_device_id);
     let mut out = Vec::with_capacity(32 + sealed.len());
     out.extend_from_slice(eph_pub.as_bytes());
     out.extend_from_slice(&sealed);
     out
 }
 
-/// Unwrap a vault key wrapped for this device by `wrap_vault_key`.
+/// Unwrap bytes wrapped for this device by `wrap_vault_key`. Returns the raw
+/// payload (a single 32-byte key, or a concatenated epoch key-list).
 pub fn unwrap_vault_key(
     device_secret: &x25519_dalek::StaticSecret,
     blob: &[u8],
     device_id: &[u8],
-) -> Result<Secret32, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if blob.len() < 32 + NONCE_LEN + 16 {
         return Err(CryptoError::Malformed);
     }
@@ -167,12 +198,7 @@ pub fn unwrap_vault_key(
     let my_pub = x25519_dalek::PublicKey::from(device_secret);
     let shared = device_secret.diffie_hellman(&eph_pub);
     let wrap_key = wrap_key_from_shared(shared.as_bytes(), eph_pub.as_bytes(), my_pub.as_bytes());
-    let pt = open(&wrap_key, &blob[32..], device_id)?;
-    let bytes: [u8; 32] = pt
-        .as_slice()
-        .try_into()
-        .map_err(|_| CryptoError::Malformed)?;
-    Ok(Zeroizing::new(bytes))
+    open(&wrap_key, &blob[32..], device_id)
 }
 
 /// HKDF both public keys into the wrap key so a wrapped blob is bound to exactly
@@ -286,13 +312,28 @@ mod tests {
         let vk = key();
         let dev = new_device_keys();
         let dev_pub = x25519_dalek::PublicKey::from(&dev.x25519);
-        let wrapped = wrap_vault_key(&vk, &dev_pub, b"device-1");
+        let wrapped = wrap_vault_key(vk.as_ref(), &dev_pub, b"device-1");
         let unwrapped = unwrap_vault_key(&dev.x25519, &wrapped, b"device-1").unwrap();
-        assert_eq!(unwrapped.as_ref(), vk.as_ref());
+        assert_eq!(unwrapped.as_slice(), vk.as_ref());
         // bound to device id: replay under another id fails
         assert!(unwrap_vault_key(&dev.x25519, &wrapped, b"device-2").is_err());
         // bound to recipient: another device cannot unwrap
         let other = new_device_keys();
         assert!(unwrap_vault_key(&other.x25519, &wrapped, b"device-1").is_err());
+    }
+
+    #[test]
+    fn epoch_keys_differ_and_epoch0_matches_phrase_key() {
+        let (phrase, keys) = new_phrase();
+        // epoch 0 derivation must equal the original vault-key derivation, or
+        // pre-rotation vaults would fail to decrypt after this change.
+        let e0 = vault_key_at_epoch(&phrase, 0).unwrap();
+        assert_eq!(e0.as_ref(), keys.vault_key.as_ref());
+        let e1 = vault_key_at_epoch(&phrase, 1).unwrap();
+        let e2 = vault_key_at_epoch(&phrase, 2).unwrap();
+        assert_ne!(e0.as_ref(), e1.as_ref());
+        assert_ne!(e1.as_ref(), e2.as_ref());
+        // deterministic per epoch
+        assert_eq!(e1.as_ref(), vault_key_at_epoch(&phrase, 1).unwrap().as_ref());
     }
 }

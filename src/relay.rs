@@ -20,8 +20,8 @@
 
 use crate::proto::{
     now_unix, signing_message, ApproveReq, DeviceInfo, DevicesResp, EnrollReq, EnrollResp,
-    PullResp, PushReq, PushResp, RecoverReq, RecoverResp, RevokeReq, Signed, WireEntry,
-    WrappedResp, MAX_SKEW_SECS,
+    PullResp, PushReq, PushResp, RecoverReq, RecoverResp, RevokeReq, RotateReq, ShareGrantReq,
+    ShareMembership, ShareRotateReq, SharesResp, Signed, WireEntry, WrappedResp, MAX_SKEW_SECS,
 };
 use axum::{
     extract::{ws::WebSocketUpgrade, Query, State},
@@ -63,6 +63,10 @@ pub async fn serve(addr: &str, db_path: &str) -> anyhow::Result<()> {
         .route("/v1/enroll", post(enroll))
         .route("/v1/approve", post(approve))
         .route("/v1/revoke", post(revoke))
+        .route("/v1/rotate", post(rotate))
+        .route("/v1/share/grant", post(share_grant))
+        .route("/v1/share/rotate", post(share_rotate))
+        .route("/v1/shares", get(shares))
         .route("/v1/devices", get(devices))
         .route("/v1/wrapped", get(wrapped))
         .route("/v1/recover", post(recover))
@@ -81,11 +85,16 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS vaults (
             vault_id      TEXT PRIMARY KEY,
-            recovery_pub  BLOB NOT NULL
+            recovery_pub  BLOB NOT NULL,
+            epoch         INTEGER NOT NULL DEFAULT 0
         )",
     )
     .execute(db)
     .await?;
+    // Older relays predate the epoch column; add it if missing (ignore if not).
+    let _ = sqlx::query("ALTER TABLE vaults ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0")
+        .execute(db)
+        .await;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS devices (
             vault_id     TEXT NOT NULL,
@@ -106,12 +115,81 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             seq       INTEGER PRIMARY KEY AUTOINCREMENT,
             entry_id  BLOB NOT NULL,
             blob      BLOB NOT NULL,
+            share_id  BLOB NOT NULL DEFAULT x'00000000000000000000000000000000',
             UNIQUE (vault_id, entry_id)
         )",
     )
     .execute(db)
     .await?;
+    // Older relays predate share_id; add it (nil default = the default share).
+    let _ = sqlx::query(
+        "ALTER TABLE entries ADD COLUMN share_id BLOB NOT NULL \
+         DEFAULT x'00000000000000000000000000000000'",
+    )
+    .execute(db)
+    .await;
+    // Per-share epoch counter (named shares only; the default share's epoch lives
+    // in vaults.epoch). Absence of a row means epoch 0.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS shares (
+            vault_id  TEXT NOT NULL,
+            share_id  BLOB NOT NULL,
+            epoch     INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (vault_id, share_id)
+        )",
+    )
+    .execute(db)
+    .await?;
+    // Share membership + each member's wrapped key-list. A device may pull a
+    // share's entries iff it has a row here (or the share is nil).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS share_members (
+            vault_id     TEXT NOT NULL,
+            share_id     BLOB NOT NULL,
+            ed25519_pub  BLOB NOT NULL,
+            wrapped_key  BLOB NOT NULL,
+            PRIMARY KEY (vault_id, share_id, ed25519_pub)
+        )",
+    )
+    .execute(db)
+    .await?;
+    // Replay cache for non-idempotent authenticated endpoints (rotate; future
+    // team-vault mutations). Keyed on the raw 64-byte signature; rows expire
+    // after the skew window. Persisted so a relay restart doesn't reopen the
+    // replay window. ponytail: lazy GC on insert, add a timer only if it grows.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS seen_sigs (
+            sig         BLOB PRIMARY KEY,
+            expires_at  INTEGER NOT NULL
+        )",
+    )
+    .execute(db)
+    .await?;
     Ok(())
+}
+
+/// Record a signature as seen, returning `false` if it was already present (a
+/// replay). Opportunistically evicts expired rows. Only called on the
+/// non-idempotent endpoints — idempotent ones don't need it (see crypto-design).
+async fn mark_seen(db: &SqlitePool, sig_b64: &str) -> Result<bool, (StatusCode, String)> {
+    let sig = B64
+        .decode(sig_b64)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "sig".to_string()))?;
+    let now = now_unix();
+    sqlx::query("DELETE FROM seen_sigs WHERE expires_at < ?")
+        .bind(now)
+        .execute(db)
+        .await
+        .map_err(db_err)?;
+    let inserted = sqlx::query("INSERT OR IGNORE INTO seen_sigs (sig, expires_at) VALUES (?, ?)")
+        .bind(sig)
+        .bind(now + MAX_SKEW_SECS)
+        .execute(db)
+        .await
+        .map_err(db_err)?
+        .rows_affected()
+        > 0;
+    Ok(inserted)
 }
 
 // ---- auth -------------------------------------------------------------------
@@ -309,8 +387,246 @@ async fn revoke(
     Ok(Json(PushResp { head, stored: 0 }))
 }
 
-/// List devices for a vault (signed GET, any approved device). Lets an approver
-/// see pending devices to approve and their X25519 keys to wrap for.
+/// Rotate the vault key. Signed by an approved device (which proved it holds the
+/// recovery phrase locally by minting the new epoch key). Bumps the vault epoch
+/// and stores the re-wrapped key-list for every remaining device. The revoked
+/// device is simply not among the `wrapped` recipients, so it never receives the
+/// new key — that is the whole point of rotation.
+///
+/// Non-idempotent (it advances an epoch counter), so it is the first endpoint
+/// gated by the seen-signature cache. The epoch bump is also guarded
+/// (`WHERE epoch = ? - 1`) so a within-window duplicate that slips the cache
+/// still can't double-advance.
+async fn rotate(
+    State(st): State<AppState>,
+    Json(signed): Json<Signed>,
+) -> Result<Json<PushResp>, (StatusCode, String)> {
+    let (vault, key) = verify(&signed)?;
+    if !can_sync(&st.db, &vault, &key).await {
+        return Err((StatusCode::FORBIDDEN, "rotator not approved".into()));
+    }
+    if !mark_seen(&st.db, &signed.sig_b64).await? {
+        return Err((StatusCode::CONFLICT, "replayed request".into()));
+    }
+    let req: RotateReq = json_body(&signed.body)?;
+    // Advance the epoch, but only from exactly the previous one — rejects stale
+    // or double rotations even if the signature cache is ever bypassed.
+    let bumped = sqlx::query("UPDATE vaults SET epoch = ? WHERE vault_id = ? AND epoch = ?")
+        .bind(req.epoch as i64)
+        .bind(&vault)
+        .bind(req.epoch as i64 - 1)
+        .execute(&st.db)
+        .await
+        .map_err(db_err)?
+        .rows_affected()
+        > 0;
+    if !bumped {
+        return Err((StatusCode::CONFLICT, "epoch already advanced".into()));
+    }
+    // Store each remaining device's re-wrapped key-list. A revoked device is not
+    // in this list, and we guard on revoked = 0 so a racing revoke still wins.
+    for w in &req.wrapped {
+        let target = B64
+            .decode(&w.device_pub_b64)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "device_pub".to_string()))?;
+        let wrapped = B64
+            .decode(&w.wrapped_key_b64)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "wrapped_key".to_string()))?;
+        sqlx::query(
+            "UPDATE devices SET wrapped_key = ?
+             WHERE vault_id = ? AND ed25519_pub = ? AND revoked = 0",
+        )
+        .bind(wrapped)
+        .bind(&vault)
+        .bind(&target)
+        .execute(&st.db)
+        .await
+        .map_err(db_err)?;
+    }
+    let head = head(&st.db, &vault).await.map_err(db_err)?;
+    Ok(Json(PushResp { head, stored: 0 }))
+}
+
+fn decode_share(b64: &str) -> Result<Vec<u8>, (StatusCode, String)> {
+    B64.decode(b64)
+        .ok()
+        .filter(|b| b.len() == 16)
+        .ok_or((StatusCode::BAD_REQUEST, "share_id".to_string()))
+}
+
+/// Grant one or more devices membership in a share by storing each a wrapped
+/// key-list. Signed by any approved device (the "any member manages" model). The
+/// relay stores membership + opaque wrapped blobs and enforces no policy: a
+/// caller who doesn't actually hold the share key can only store a wrap the
+/// target can't open, which grants nothing. Idempotent (upsert), so replay-safe
+/// without the seen-sig cache.
+async fn share_grant(
+    State(st): State<AppState>,
+    Json(signed): Json<Signed>,
+) -> Result<Json<PushResp>, (StatusCode, String)> {
+    let (vault, key) = verify(&signed)?;
+    if !can_sync(&st.db, &vault, &key).await {
+        return Err((StatusCode::FORBIDDEN, "granter not approved".into()));
+    }
+    let req: ShareGrantReq = json_body(&signed.body)?;
+    let share = decode_share(&req.share_id_b64)?;
+    // Record the share's epoch (idempotent; a stale epoch can't lower it).
+    sqlx::query(
+        "INSERT INTO shares (vault_id, share_id, epoch) VALUES (?, ?, ?)
+         ON CONFLICT (vault_id, share_id) DO UPDATE SET epoch = MAX(epoch, excluded.epoch)",
+    )
+    .bind(&vault)
+    .bind(&share)
+    .bind(req.epoch as i64)
+    .execute(&st.db)
+    .await
+    .map_err(db_err)?;
+    for w in &req.wrapped {
+        let target = B64
+            .decode(&w.device_pub_b64)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "device_pub".to_string()))?;
+        let wrapped = B64
+            .decode(&w.wrapped_key_b64)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "wrapped_key".to_string()))?;
+        sqlx::query(
+            "INSERT INTO share_members (vault_id, share_id, ed25519_pub, wrapped_key)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (vault_id, share_id, ed25519_pub)
+             DO UPDATE SET wrapped_key = excluded.wrapped_key",
+        )
+        .bind(&vault)
+        .bind(&share)
+        .bind(&target)
+        .bind(wrapped)
+        .execute(&st.db)
+        .await
+        .map_err(db_err)?;
+    }
+    let head = head(&st.db, &vault).await.map_err(db_err)?;
+    Ok(Json(PushResp { head, stored: 0 }))
+}
+
+/// Rotate a share on member removal: bump its epoch, re-wrap for remaining
+/// members, and drop the removed ones. Same seen-sig gating + guarded bump as
+/// `/v1/rotate` (it advances a counter, so it's non-idempotent).
+async fn share_rotate(
+    State(st): State<AppState>,
+    Json(signed): Json<Signed>,
+) -> Result<Json<PushResp>, (StatusCode, String)> {
+    let (vault, key) = verify(&signed)?;
+    if !can_sync(&st.db, &vault, &key).await {
+        return Err((StatusCode::FORBIDDEN, "rotator not approved".into()));
+    }
+    if !mark_seen(&st.db, &signed.sig_b64).await? {
+        return Err((StatusCode::CONFLICT, "replayed request".into()));
+    }
+    let req: ShareRotateReq = json_body(&signed.body)?;
+    let share = decode_share(&req.share_id_b64)?;
+    // Guarded bump: only from exactly the previous epoch. A share seen for the
+    // first time here (epoch 1 with no prior row) is inserted at epoch 1.
+    let bumped = sqlx::query(
+        "UPDATE shares SET epoch = ? WHERE vault_id = ? AND share_id = ? AND epoch = ?",
+    )
+    .bind(req.epoch as i64)
+    .bind(&vault)
+    .bind(&share)
+    .bind(req.epoch as i64 - 1)
+    .execute(&st.db)
+    .await
+    .map_err(db_err)?
+    .rows_affected()
+        > 0;
+    if !bumped {
+        // Allow first-ever rotation of a share the relay never saw an epoch for.
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO shares (vault_id, share_id, epoch) VALUES (?, ?, ?)",
+        )
+        .bind(&vault)
+        .bind(&share)
+        .bind(req.epoch as i64)
+        .execute(&st.db)
+        .await
+        .map_err(db_err)?
+        .rows_affected()
+            > 0;
+        if !inserted {
+            return Err((StatusCode::CONFLICT, "epoch already advanced".into()));
+        }
+    }
+    // Drop removed members first, then re-wrap for the remaining ones.
+    for pub_b64 in &req.remove {
+        let target = B64
+            .decode(pub_b64)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "remove pub".to_string()))?;
+        sqlx::query("DELETE FROM share_members WHERE vault_id = ? AND share_id = ? AND ed25519_pub = ?")
+            .bind(&vault)
+            .bind(&share)
+            .bind(&target)
+            .execute(&st.db)
+            .await
+            .map_err(db_err)?;
+    }
+    for w in &req.wrapped {
+        let target = B64
+            .decode(&w.device_pub_b64)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "device_pub".to_string()))?;
+        let wrapped = B64
+            .decode(&w.wrapped_key_b64)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "wrapped_key".to_string()))?;
+        // UPDATE only — rotation re-keys EXISTING members. A wrap for a device
+        // that isn't a member updates zero rows (harmless), so the rotating
+        // device can safely re-wrap for every approved device without needing to
+        // know the exact membership set. Adding members is `share_grant`'s job.
+        sqlx::query(
+            "UPDATE share_members SET wrapped_key = ?
+             WHERE vault_id = ? AND share_id = ? AND ed25519_pub = ?",
+        )
+        .bind(wrapped)
+        .bind(&vault)
+        .bind(&share)
+        .bind(&target)
+        .execute(&st.db)
+        .await
+        .map_err(db_err)?;
+    }
+    let head = head(&st.db, &vault).await.map_err(db_err)?;
+    Ok(Json(PushResp { head, stored: 0 }))
+}
+
+/// Return every share this device belongs to, with its wrapped key-list and the
+/// share's current epoch. Feeds bootstrap and offline self-heal (mirrors
+/// `/v1/wrapped` for named shares). Signed GET, any approved device.
+async fn shares(
+    State(st): State<AppState>,
+    Query(q): Query<SignedQuery>,
+) -> Result<Json<SharesResp>, (StatusCode, String)> {
+    let signed = q.into_signed("shares");
+    let (vault, key) = verify(&signed)?;
+    if !can_sync(&st.db, &vault, &key).await {
+        return Err((StatusCode::FORBIDDEN, "device not approved".into()));
+    }
+    let rows = sqlx::query(
+        "SELECT m.share_id AS share_id, m.wrapped_key AS wrapped_key,
+                COALESCE(s.epoch, 0) AS epoch
+         FROM share_members m
+         LEFT JOIN shares s ON s.vault_id = m.vault_id AND s.share_id = m.share_id
+         WHERE m.vault_id = ? AND m.ed25519_pub = ?",
+    )
+    .bind(&vault)
+    .bind(key.as_bytes().as_slice())
+    .fetch_all(&st.db)
+    .await
+    .map_err(db_err)?;
+    let shares = rows
+        .into_iter()
+        .map(|row| ShareMembership {
+            share_id_b64: B64.encode(row.get::<Vec<u8>, _>("share_id")),
+            epoch: row.get::<i64, _>("epoch") as u32,
+            wrapped_key_b64: B64.encode(row.get::<Vec<u8>, _>("wrapped_key")),
+        })
+        .collect();
+    Ok(Json(SharesResp { shares }))
+}
 async fn devices(
     State(st): State<AppState>,
     Query(q): Query<SignedQuery>,
@@ -359,11 +675,19 @@ async fn wrapped(
     if row.get::<i64, _>("revoked") != 0 {
         return Err((StatusCode::FORBIDDEN, "device is revoked".into()));
     }
+    let epoch = sqlx::query("SELECT epoch FROM vaults WHERE vault_id = ?")
+        .bind(&vault)
+        .fetch_optional(&st.db)
+        .await
+        .map_err(db_err)?
+        .map(|r| r.get::<i64, _>("epoch") as u32)
+        .unwrap_or(0);
     Ok(Json(WrappedResp {
         approved: row.get::<i64, _>("approved") != 0,
         wrapped_key_b64: row
             .get::<Option<Vec<u8>>, _>("wrapped_key")
             .map(|b| B64.encode(b)),
+        epoch,
     }))
 }
 
@@ -454,12 +778,23 @@ async fn push(
         let blob = B64
             .decode(&e.blob_b64)
             .map_err(|_| (StatusCode::BAD_REQUEST, "blob".to_string()))?;
+        // share_id is cleartext routing metadata; empty/absent means the default
+        // (nil) share, so old clients that never send it keep working.
+        let share_id = if e.share_id_b64.is_empty() {
+            vec![0u8; 16]
+        } else {
+            B64.decode(&e.share_id_b64)
+                .ok()
+                .filter(|b| b.len() == 16)
+                .ok_or((StatusCode::BAD_REQUEST, "share_id".to_string()))?
+        };
         let res = sqlx::query(
-            "INSERT OR IGNORE INTO entries (vault_id, entry_id, blob) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO entries (vault_id, entry_id, blob, share_id) VALUES (?, ?, ?, ?)",
         )
         .bind(&vault)
         .bind(entry_id)
         .bind(blob)
+        .bind(share_id)
         .execute(&st.db)
         .await
         .map_err(db_err)?;
@@ -528,24 +863,39 @@ async fn pull(
             "device not enrolled or revoked".into(),
         ));
     }
+    // Membership filter: a device may pull an entry iff it's in the default
+    // (nil) share OR has a share_members row for that entry's share. The relay
+    // enforces this as routing, never as a decryption gate — non-members simply
+    // aren't handed the ciphertext.
     let rows = sqlx::query(
-        "SELECT seq, entry_id, blob FROM entries
-         WHERE vault_id = ? AND seq > ? ORDER BY seq",
+        "SELECT seq, entry_id, blob, share_id FROM entries
+         WHERE vault_id = ? AND seq > ?
+           AND (share_id = x'00000000000000000000000000000000'
+                OR EXISTS (SELECT 1 FROM share_members m
+                           WHERE m.vault_id = entries.vault_id
+                             AND m.share_id = entries.share_id
+                             AND m.ed25519_pub = ?))
+         ORDER BY seq",
     )
     .bind(&vault)
     .bind(q.since as i64)
+    .bind(key.as_bytes().as_slice())
     .fetch_all(&st.db)
     .await
     .map_err(db_err)?;
-    let mut head = q.since;
     let mut entries = Vec::with_capacity(rows.len());
     for row in rows {
-        head = row.get::<i64, _>("seq") as u64;
         entries.push(WireEntry {
             entry_id_b64: B64.encode(row.get::<Vec<u8>, _>("entry_id")),
             blob_b64: B64.encode(row.get::<Vec<u8>, _>("blob")),
+            share_id_b64: B64.encode(row.get::<Vec<u8>, _>("share_id")),
         });
     }
+    // Advance the cursor past ALL entries, including ones filtered out above —
+    // otherwise a trailing non-member entry would stall the cursor and be
+    // re-pulled forever. A device newly granted a share resets its cursor to
+    // re-fetch what it skipped (see sync::heal_shares).
+    let head = head(&st.db, &vault).await.map_err(db_err)?.max(q.since);
     Ok(Json(PullResp { entries, head }))
 }
 

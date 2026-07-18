@@ -30,6 +30,9 @@ ssh web                              # just works
 sshvault snippet run logs
 ```
 
+Or watch it end-to-end: [`scripts/demo.sh`](scripts/demo.sh) runs the whole
+quickstart — including two-device sync — against a local relay in a temp dir.
+
 ## Sync across machines
 
 ```sh

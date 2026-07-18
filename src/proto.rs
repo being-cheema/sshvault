@@ -16,6 +16,11 @@ pub struct WireEntry {
     pub entry_id_b64: String,
     /// Sealed record bytes (`nonce||ct`), base64. Relay never decrypts this.
     pub blob_b64: String,
+    /// 16-byte share id, base64 (nil = default share). Cleartext routing metadata
+    /// — like `entry_id`, the relay uses it to filter pulls by membership and
+    /// never learns anything about contents from it. Defaults to nil.
+    #[serde(default)]
+    pub share_id_b64: String,
 }
 
 /// `POST /v1/push` body: entries this device holds that it wants the relay to store.
@@ -80,6 +85,72 @@ pub struct RevokeReq {
     pub target_pub_b64: String,
 }
 
+/// `POST /v1/rotate` body (signed by an approved device that holds the recovery
+/// phrase). Bumps the vault to `epoch` and re-wraps the new epoch key-list for
+/// every *remaining* device. Each entry is the wrapped key-list for one device,
+/// keyed by its Ed25519 public key; the revoked device is deliberately absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotateReq {
+    /// New epoch the vault moves to (must be exactly current + 1).
+    pub epoch: u32,
+    /// Per-device re-wrapped key-lists.
+    pub wrapped: Vec<WrappedFor>,
+}
+
+/// A vault key-list wrapped for one device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrappedFor {
+    /// Ed25519 pub (base64) of the recipient device.
+    pub device_pub_b64: String,
+    /// The epoch key-list wrapped for that device (base64).
+    pub wrapped_key_b64: String,
+}
+
+/// `POST /v1/share/grant` body (signed by any device that holds the share key):
+/// admit one or more devices to `share_id` by handing each its wrapped key-list.
+/// "Any member manages" — the relay stores membership + wrapped blobs and
+/// enforces no policy; holding the key IS the authorization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareGrantReq {
+    /// 16-byte share id, base64.
+    pub share_id_b64: String,
+    /// Current epoch of the share (so members can tell a stale grant from fresh).
+    pub epoch: u32,
+    /// Wrapped key-lists, one per newly-admitted device.
+    pub wrapped: Vec<WrappedFor>,
+}
+
+/// `POST /v1/share/rotate` body (signed by a member): rotate a share on member
+/// removal. Same shape and seen-sig gating as `/v1/rotate`, but for a named
+/// share and with a RANDOM new key (members lack the seed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareRotateReq {
+    pub share_id_b64: String,
+    /// New epoch (must be current + 1).
+    pub epoch: u32,
+    /// Re-wrapped key-lists for every *remaining* member.
+    pub wrapped: Vec<WrappedFor>,
+    /// Ed25519 pubs (base64) to drop from membership (the removed members).
+    pub remove: Vec<String>,
+}
+
+/// One share this device belongs to, as returned by `GET /v1/shares`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareMembership {
+    pub share_id_b64: String,
+    pub epoch: u32,
+    /// This device's wrapped key-list for the share (base64).
+    pub wrapped_key_b64: String,
+}
+
+/// `GET /v1/shares` response: every share this device is a member of, with its
+/// wrapped key-list. Feeds bootstrap and offline self-heal (mirrors `/v1/wrapped`
+/// for the default share).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharesResp {
+    pub shares: Vec<ShareMembership>,
+}
+
 /// One device as seen by `GET /v1/devices`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -100,8 +171,13 @@ pub struct DevicesResp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WrappedResp {
     pub approved: bool,
-    /// The vault key wrapped for this device (base64), once an approver set it.
+    /// The vault key-list wrapped for this device (base64), once an approver set
+    /// it. After a rotation this is the re-wrapped list for the new epoch.
     pub wrapped_key_b64: Option<String>,
+    /// The vault's current epoch, so a device can tell whether the wrapped list
+    /// it holds is stale and needs re-fetching (offline self-heal).
+    #[serde(default)]
+    pub epoch: u32,
 }
 
 /// `POST /v1/recover` body: prove ownership of the recovery key to re-admit a
