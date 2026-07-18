@@ -1,5 +1,9 @@
 # sshvault
 
+[![crates.io](https://img.shields.io/crates/v/sshvault.svg)](https://crates.io/crates/sshvault)
+[![CI](https://github.com/being-cheema/sshvault/actions/workflows/ci.yml/badge.svg)](https://github.com/being-cheema/sshvault/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/sshvault.svg)](#license)
+
 **End-to-end-encrypted sync for your SSH workflow** — hosts, `~/.ssh/config`
 entries, snippets, and port-forwards, kept in sync across all your machines. One
 small binary that is both the client CLI and the self-hostable relay server.
@@ -48,14 +52,11 @@ See [docs/architecture.md](docs/architecture.md),
 cargo install sshvault
 ```
 
-> Publishing to crates.io is pending the first release; until then use a source
-> or binary install below.
-
 **Prebuilt binaries** — grab the archive for your platform from the
 [latest release](https://github.com/being-cheema/sshvault/releases/latest),
 unpack, and put `sshvault` on your `PATH`.
 
-**From source** (works today):
+**From source:**
 
 ```sh
 git clone https://github.com/being-cheema/sshvault
