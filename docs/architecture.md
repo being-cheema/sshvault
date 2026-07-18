@@ -130,8 +130,9 @@ back and reuse a clock.
   approver wraps vault key to the new device's X25519 key (ephemeral-static ECDH,
   see crypto-design.md) and uploads it. Server marks device active.
 - **Revoke**: server marks device revoked → auth rejected on next sync; wrapped key
-  deleted. v0.1 does **not** rotate the vault key (revoked device already knew it);
-  honest note in threat-model.md.
+  deleted. Plain `revoke` is access-control only; `revoke --rotate` mints a new
+  phrase-derived vault-key epoch and re-wraps it for the remaining devices, giving
+  forward secrecy against the revoked device (see threat-model.md).
 - **Recover**: BIP39 phrase → vault key + recovery Ed25519 keypair; server stored the
   recovery public key at vault creation; a fresh device signs its enrollment with the
   recovery key and is auto-approved.

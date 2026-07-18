@@ -7,6 +7,11 @@ rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 description = "End-to-end-encrypted sync for SSH workflows: hosts, config, snippets, port-forwards"
 repository = "https://github.com/being-cheema/sshvault"
+homepage = "https://github.com/being-cheema/sshvault"
+readme = "README.md"
+keywords = ["ssh", "sync", "encryption", "e2ee", "cli"]
+categories = ["command-line-utilities", "cryptography"]
+exclude = ["/docs", "/scripts", "/.github", "/tests"]
 
 [dependencies]
 # crypto — RustCrypto + dalek only (see docs/crypto-design.md)
