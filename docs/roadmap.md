@@ -6,18 +6,24 @@ decryption path) and **no custom cryptography** (`crypto-design.md`, rule zero).
 
 ## v0.2 (next)
 
-### Optional encrypted private-key sync
+### Optional encrypted private-key sync — DONE
 
-v0.1 rejects private key material outright (`vault.rs`: "refusing to store private
-key material… v0.1 syncs key metadata only"); `crypto-design.md` already reserves
-the extension point: "an opt-in encrypted private-key record type using the same
-envelope." Approach: a new record kind, **opt-in per key** via an explicit flag
-(`sshvault key add --sync-private`), each key wrapped separately under VK with the
-same XChaCha20-Poly1305 + AAD envelope — the relay still sees only entry_id + blob,
-so zero-knowledge is untouched. Hard part: the pull side — materializing the key to
-disk with 0600 perms (or straight into ssh-agent) without ever logging or lingering
-in temp files, and making the opt-in impossible to trip accidentally (the v0.1
-rejection stays the default for `KeyMeta`).
+Shipped as `Kind::PrivateKey` records with an explicit opt-in CLI:
+`key add-private <name> --private <path>` stores a PEM key (sealed end-to-end like
+every record — same XChaCha20-Poly1305 + entry_id AAD envelope, relay still sees
+only `entry_id + blob`, zero-knowledge untouched), and `key install <name>` writes
+it back to disk. The v0.1 rejection stays the default: `validate_payload` still
+refuses "PRIVATE KEY" for every other kind; the carve-out is gated strictly on
+`Kind::PrivateKey`. Materialization writes **0600 at file creation** (O_EXCL, no
+world-readable window — deliberately not the log's `atomic_write`, which chmods
+after writing), tightens `~/.ssh` to 0700, refuses overwrite without `--force`,
+and holds the PEM in `Zeroizing`. The install destination derived from a record
+name is constrained to a single plain filename under `~/.ssh` (`safe_key_name`),
+closing a path-injection an adversarial review caught where a synced record named
+`config`/`../x`/an absolute path could overwrite an arbitrary file.
+
+Follow-up (low, defense-in-depth): plaintext key_pem still passes through
+non-zeroized serde intermediates; the sealed buffer is zeroized.
 
 ### Windows support
 
