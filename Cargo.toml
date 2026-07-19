@@ -9,7 +9,7 @@ description = "End-to-end-encrypted sync for SSH workflows: hosts, config, snipp
 repository = "https://github.com/being-cheema/sshvault"
 homepage = "https://github.com/being-cheema/sshvault"
 readme = "README.md"
-keywords = ["ssh", "sync", "encryption", "e2ee", "cli"]
+keywords = ["ssh", "sync", "encryption", "termius-alternative", "cli"]
 categories = ["command-line-utilities", "cryptography"]
 exclude = ["/docs", "/scripts", "/.github", "/tests"]
 

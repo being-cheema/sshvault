@@ -23,6 +23,30 @@ laptop to laptop — encrypted so the sync server never sees them in the clear.
   iTerm / your terminal emulator. sshvault is a config-and-secrets layer *under*
   `ssh`, not a terminal client. It never opens shells for you ([non-goals](docs/roadmap.md#explicit-non-goals)).
 
+### Coming from Termius?
+
+sshvault is **not** a Termius replacement — it has no terminal, no tabs, no
+built-in SFTP. What it *does* replace is the part of Termius people are often
+least comfortable with: **syncing your SSH hosts, snippets, and keys through a
+company's cloud, behind a subscription.** sshvault does that sync end-to-end
+encrypted, self-hostable, and free — then hands off to the `ssh` you already use.
+
+| | Termius | sshvault |
+|---|---|---|
+| Sync hosts / snippets / port-forwards | ✅ | ✅ |
+| Team sharing | ✅ (paid) | ✅ (encrypted [shares](docs/architecture.md)) |
+| Encrypted key sync | ✅ | ✅ (opt-in, [zero-knowledge](docs/threat-model.md)) |
+| Server can read your data | Trust their cloud | ❌ never — zero-knowledge relay |
+| Self-host the sync server | ❌ | ✅ ([one binary](docs/self-hosting.md)) |
+| Terminal emulator / tabs / SFTP | ✅ | ❌ — use your own `ssh` |
+| Mobile / GUI app | ✅ | ❌ — CLI only |
+| Price | Freemium / subscription | Free, open source |
+
+If what you liked about Termius was the terminal UI, keep using it — sshvault
+sits happily underneath any client that reads `~/.ssh/config`. If what you wanted
+was your SSH setup to follow you across machines *without* handing it to someone
+else's server, that's exactly what this is.
+
 ## Highlights
 
 - **E2EE, zero-knowledge relay.** Every record is XChaCha20-Poly1305 ciphertext
