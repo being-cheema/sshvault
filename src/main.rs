@@ -1,8 +1,10 @@
 //! sshvault CLI. Thin dispatch layer: all logic lives in the library modules.
 
 use anyhow::{bail, Context, Result};
+use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use sshvault::record::{ForwardKind, Host, Kind, PortForward, Snippet};
+use sha2::{Digest, Sha256};
+use sshvault::record::{ForwardKind, Host, KeyMeta, Kind, PortForward, Snippet};
 use sshvault::sshconfig;
 use sshvault::vault::{self, Vault};
 use std::path::PathBuf;
@@ -31,6 +33,11 @@ enum Cmd {
     Snippet {
         #[command(subcommand)]
         cmd: SnippetCmd,
+    },
+    /// Manage SSH key metadata (public keys only — private keys never enter the vault)
+    Key {
+        #[command(subcommand)]
+        cmd: KeyCmd,
     },
     /// Manage port-forward definitions
     Fwd {
@@ -232,6 +239,34 @@ enum SnippetCmd {
 }
 
 #[derive(Subcommand)]
+enum KeyCmd {
+    /// Add key metadata from a public-key file (private keys are rejected)
+    Add {
+        name: String,
+        /// Path to the PUBLIC key file (e.g. ~/.ssh/id_ed25519.pub)
+        #[arg(long)]
+        pubkey: PathBuf,
+        /// Host alias that uses this key (repeatable)
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+    },
+    /// Edit key metadata (only the flags you pass change)
+    Edit {
+        name: String,
+        /// Path to a new PUBLIC key file
+        #[arg(long)]
+        pubkey: Option<PathBuf>,
+        /// Host alias that uses this key (repeatable); replaces all hosts
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+    },
+    /// Remove key metadata
+    Rm { name: String },
+    /// List key metadata
+    List,
+}
+
+#[derive(Subcommand)]
 enum FwdCmd {
     /// Add a port-forward
     Add {
@@ -295,6 +330,7 @@ fn run() -> Result<()> {
         Cmd::Init { device_name } => init(&device_name),
         Cmd::Host { cmd } => host_cmd(cmd),
         Cmd::Snippet { cmd } => snippet_cmd(cmd),
+        Cmd::Key { cmd } => key_cmd(cmd),
         Cmd::Fwd { cmd } => fwd_cmd(cmd),
         Cmd::Apply { ssh_dir } => apply(ssh_dir),
         Cmd::Export => {
@@ -482,6 +518,94 @@ fn snippet_cmd(cmd: SnippetCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn key_cmd(cmd: KeyCmd) -> Result<()> {
+    let mut v = open_vault()?;
+    match cmd {
+        KeyCmd::Add {
+            name,
+            pubkey,
+            hosts,
+        } => {
+            let public_key = read_public_key(&pubkey)?;
+            let fingerprint = ssh_fingerprint(&public_key);
+            let key = KeyMeta {
+                name: name.clone(),
+                public_key,
+                fingerprint,
+                hosts,
+            };
+            v.add(Kind::KeyMeta, "name", &name, &key)?;
+            println!("added key '{name}'");
+        }
+        KeyCmd::Edit {
+            name,
+            pubkey,
+            hosts,
+        } => {
+            let rec = v
+                .find(Kind::KeyMeta, "name", &name)
+                .with_context(|| format!("key '{name}' not found"))?;
+            let mut key: KeyMeta = rec.payload()?;
+            if let Some(path) = pubkey {
+                let public_key = read_public_key(&path)?;
+                key.fingerprint = ssh_fingerprint(&public_key);
+                key.public_key = public_key;
+            }
+            if !hosts.is_empty() {
+                key.hosts = hosts
+            }
+            v.edit(Kind::KeyMeta, "name", &name, &key)?;
+            println!("updated key '{name}'");
+        }
+        KeyCmd::Rm { name } => {
+            v.remove(Kind::KeyMeta, "name", &name)?;
+            println!("removed key '{name}'");
+        }
+        KeyCmd::List => {
+            let mut keys = v.list::<KeyMeta>(Kind::KeyMeta);
+            keys.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+            for (_, k) in keys {
+                let fp = k.fingerprint.as_deref().unwrap_or("(no fingerprint)");
+                let hosts = if k.hosts.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (hosts: {})", k.hosts.join(", "))
+                };
+                println!("{}  {fp}{hosts}", k.name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a PUBLIC key file, rejecting anything that looks like private key
+/// material. The vault layer enforces this too, but we fail early with a
+/// friendly message so private keys never even reach the vault.
+fn read_public_key(path: &std::path::Path) -> Result<String> {
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    if contents.contains("PRIVATE KEY") {
+        bail!(
+            "{} looks like a PRIVATE key — only public keys (.pub) belong in the vault",
+            path.display()
+        );
+    }
+    Ok(contents.trim().to_string())
+}
+
+/// Compute an OpenSSH-style fingerprint (`SHA256:<base64-no-pad>`) over the
+/// wire blob (the base64-decoded second field of a `ssh-* <base64> comment`
+/// line). Returns `None` if the line has no parseable base64 blob.
+fn ssh_fingerprint(public_key: &str) -> Option<String> {
+    let blob_b64 = public_key.split_whitespace().nth(1)?;
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(blob_b64)
+        .ok()?;
+    let digest = Sha256::digest(&blob);
+    let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest);
+    Some(format!("SHA256:{b64}"))
 }
 
 fn fwd_cmd(cmd: FwdCmd) -> Result<()> {
@@ -873,4 +997,65 @@ fn hostname() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unnamed-device".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ssh_fingerprint;
+
+    /// A well-formed OpenSSH ed25519 public-key line (51-byte wire blob).
+    const PUBKEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDCypbnDnL/FGaVRCiLo6/QO2ueMrRKGBUhexVRJ/3HX test@host";
+
+    /// Ask `ssh-keygen -lf` for the fingerprint of a pubkey line, if available.
+    /// Returns the `SHA256:...` token, or None if ssh-keygen isn't installed /
+    /// rejects the input.
+    fn ssh_keygen_fingerprint(pubkey: &str) -> Option<String> {
+        let dir = tempfile::tempdir().ok()?;
+        let path = dir.path().join("k.pub");
+        std::fs::write(&path, format!("{pubkey}\n")).ok()?;
+        let out = std::process::Command::new("ssh-keygen")
+            .arg("-lf")
+            .arg(&path)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        // Output: "256 SHA256:<b64> comment (ED25519)"
+        String::from_utf8(out.stdout)
+            .ok()?
+            .split_whitespace()
+            .find(|f| f.starts_with("SHA256:"))
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn fingerprint_matches_ssh_keygen_or_is_well_formed() {
+        let got = ssh_fingerprint(PUBKEY).expect("well-formed pubkey yields a fingerprint");
+
+        match ssh_keygen_fingerprint(PUBKEY) {
+            Some(expected) => {
+                // Known-answer: our fingerprint must equal ssh-keygen's exactly.
+                assert_eq!(got, expected, "fingerprint disagrees with ssh-keygen");
+            }
+            None => {
+                // ssh-keygen unavailable: assert the OpenSSH format and stability.
+                let b64 = got.strip_prefix("SHA256:").expect("SHA256: prefix");
+                assert_eq!(b64.len(), 43, "SHA256 → 32 bytes → 43 no-pad base64 chars");
+                assert!(!b64.contains('='), "no-pad base64 has no trailing '='");
+                assert_eq!(
+                    got,
+                    ssh_fingerprint(PUBKEY).unwrap(),
+                    "fingerprint is deterministic across calls"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unparseable_key_has_no_fingerprint() {
+        // No base64 second field → None, but the caller still stores public_key.
+        assert_eq!(ssh_fingerprint("not-a-key"), None);
+        assert_eq!(ssh_fingerprint(""), None);
+    }
 }

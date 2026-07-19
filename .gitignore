@@ -1,2 +1,5 @@
 /target
 .DS_Store
+
+# Claude Code harness scratch
+.claude/
