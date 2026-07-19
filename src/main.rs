@@ -71,6 +71,13 @@ enum Cmd {
         /// SQLite database path
         #[arg(long, default_value = "sshvault-relay.db")]
         db: String,
+        /// PEM certificate chain to terminate TLS directly (requires --tls-key).
+        /// Omit to serve plain HTTP behind a reverse proxy.
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<std::path::PathBuf>,
+        /// PEM private key matching --tls-cert.
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<std::path::PathBuf>,
     },
     /// Manage devices enrolled in your vault
     Device {
@@ -298,7 +305,12 @@ fn run() -> Result<()> {
         Cmd::Import { file } => import(&file),
         Cmd::Sync { relay } => sync(relay),
         Cmd::Syncd { apply } => syncd(apply),
-        Cmd::Serve { addr, db } => serve(&addr, &db),
+        Cmd::Serve {
+            addr,
+            db,
+            tls_cert,
+            tls_key,
+        } => serve(&addr, &db, tls_cert, tls_key),
         Cmd::Device { cmd } => device_cmd(cmd),
         Cmd::Share { cmd } => share_cmd(cmd),
         Cmd::Recover { relay, device_name } => recover(&relay, &device_name),
@@ -636,12 +648,22 @@ fn syncd(apply: bool) -> Result<()> {
     })
 }
 
-fn serve(addr: &str, db: &str) -> Result<()> {
+fn serve(
+    addr: &str,
+    db: &str,
+    tls_cert: Option<std::path::PathBuf>,
+    tls_key: Option<std::path::PathBuf>,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
+    // clap's `requires` guarantees both or neither.
+    let tls = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => Some(sshvault::relay::TlsPaths { cert, key }),
+        _ => None,
+    };
     let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
-    rt.block_on(sshvault::relay::serve(addr, db))
+    rt.block_on(sshvault::relay::serve(addr, db, tls))
 }
 
 fn device_cmd(cmd: DeviceCmd) -> Result<()> {

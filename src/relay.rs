@@ -48,8 +48,17 @@ struct AppState {
         std::sync::Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::broadcast::Sender<u64>>>>,
 }
 
+/// TLS material for the relay: PEM-encoded certificate chain and private key.
+pub struct TlsPaths {
+    pub cert: std::path::PathBuf,
+    pub key: std::path::PathBuf,
+}
+
 /// Run the relay on `addr`, storing everything in the SQLite file at `db_path`.
-pub async fn serve(addr: &str, db_path: &str) -> anyhow::Result<()> {
+///
+/// With `tls = Some(..)` the relay terminates HTTPS itself (rustls); with `None`
+/// it serves plain HTTP and expects a TLS-terminating reverse proxy in front.
+pub async fn serve(addr: &str, db_path: &str, tls: Option<TlsPaths>) -> anyhow::Result<()> {
     let opts = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true);
@@ -75,9 +84,34 @@ pub async fn serve(addr: &str, db_path: &str) -> anyhow::Result<()> {
         .route("/v1/ws", get(ws))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("sshvault relay listening on {addr}, db {db_path}");
-    axum::serve(listener, app).await?;
+    let sockaddr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid listen address: {addr}"))?;
+    match tls {
+        Some(t) => {
+            // Several dependencies pull rustls with more than one crypto provider,
+            // so rustls can't auto-select one — install the process default here.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&t.cert, &t.key)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "loading TLS cert {} / key {}: {e}",
+                        t.cert.display(),
+                        t.key.display()
+                    )
+                })?;
+            tracing::info!("sshvault relay listening on https://{addr}, db {db_path}");
+            axum_server::bind_rustls(sockaddr, config)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        None => {
+            tracing::info!("sshvault relay listening on http://{addr} (no TLS — front with a reverse proxy), db {db_path}");
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, app).await?;
+        }
+    }
     Ok(())
 }
 

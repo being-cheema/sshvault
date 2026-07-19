@@ -16,7 +16,7 @@ pub async fn start_relay(db_path: String) -> String {
     let addr = listener.local_addr().unwrap();
     drop(listener); // serve() rebinds; race window is negligible for a test
     tokio::spawn(async move {
-        sshvault::relay::serve(&addr.to_string(), &db_path)
+        sshvault::relay::serve(&addr.to_string(), &db_path, None)
             .await
             .unwrap();
     });

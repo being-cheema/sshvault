@@ -42,14 +42,36 @@ No plaintext records, no vault key, no passphrases, no decryption path. A full
 relay compromise leaks blob sizes, timing, device public keys, and device names —
 nothing else. See [threat-model.md](threat-model.md).
 
-## TLS: put it behind a reverse proxy
+## TLS
 
-The relay serves **plain HTTP** — it does not terminate TLS. E2EE means an on-path
-attacker never sees record contents and cannot forge requests (every call is
-Ed25519-signed with a ±300 s replay window), but plaintext HTTP still exposes
+You have two options.
+
+### Option A — let the relay terminate TLS (rustls)
+
+Give `serve` a PEM certificate chain and private key and it serves HTTPS directly,
+no proxy needed:
+
+```
+sshvault serve --addr 0.0.0.0:8787 \
+  --db /var/lib/sshvault/relay.db \
+  --tls-cert /etc/sshvault/fullchain.pem \
+  --tls-key  /etc/sshvault/privkey.pem
+```
+
+Both flags are required together (clap enforces it). Point clients at
+`https://relay.example.com:8787`. You bring the certificate (Let's Encrypt via
+certbot/lego, an internal CA, or `mkcert` for a homelab); the relay does not
+obtain or renew certs itself. This is the simplest safe-by-default deployment.
+
+### Option B — put it behind a reverse proxy
+
+Without `--tls-cert/--tls-key` the relay serves **plain HTTP**. E2EE means an
+on-path attacker never sees record contents and cannot forge requests (every call
+is Ed25519-signed with a ±300 s replay window), but plaintext HTTP still exposes
 metadata the threat model already concedes to the relay — vault ids, device public
 keys and names, blob sizes, timing — to *everyone on the path*, and an active MITM
-can drop or withhold traffic at will. Terminate TLS in front:
+can drop or withhold traffic at will. So if you don't use Option A, terminate TLS
+in front:
 
 ```
 relay.example.com {

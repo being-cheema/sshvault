@@ -76,10 +76,10 @@ mobile, so sync is foreground-only. `apply` is meaningless on a phone; not porte
   WS push is a v0.2 nicety." The enrolling device should learn of approval over
   the existing `/v1/ws` channel instead of polling `/v1/wrapped` every 2 s.
 - **Seen-signature cache on the relay. — DONE** (see the rotation entry above).
-- **Native TLS option for `serve`.** The relay does not terminate TLS in v0.1
-  (run it behind caddy/nginx). An optional rustls listener would make a bare
-  relay safe-by-default for small deployments; the reverse-proxy path stays the
-  recommendation.
+- **Native TLS option for `serve`. — DONE.** `serve --tls-cert --tls-key` makes
+  the relay terminate HTTPS itself (rustls/aws-lc-rs); without them it serves plain
+  HTTP for a reverse proxy to front. See `self-hosting.md` §TLS. You bring the cert;
+  the relay does not obtain or renew certificates.
 - **Traffic-analysis padding.** `threat-model.md` concedes the relay sees blob
   sizes and timing. Bucketed padding of entry blobs is cheap and shrinks that
   channel; it will never fully close it, and the doc will keep saying so.

@@ -44,6 +44,10 @@ base64 = "0.22"
 # relay + sync
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# pin the rustls crypto provider explicitly: several deps pull rustls with both
+# aws-lc-rs and ring, so we must install a process default before serving TLS.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"], default-features = false }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
@@ -54,3 +58,4 @@ futures-util = "0.3"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+rcgen = "0.13"
