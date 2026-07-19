@@ -166,6 +166,34 @@ const META: &str = "meta.json";
 const KEYRING: &str = "keyring.enc";
 const LOG: &str = "log.bin";
 const LOCK: &str = ".lock";
+/// Local materialized-state cache (see [`Vault::compact`]). Purely a read
+/// optimization: it is derived from `log.bin` and never crosses the sync wire.
+const SNAPSHOT: &str = "snapshot.bin";
+
+/// Once the log grows past this many frames, an open builds a [`SNAPSHOT`] so the
+/// next open folds `snapshot + tail` instead of decrypting every frame.
+const COMPACT_THRESHOLD: usize = 10_000;
+
+/// The materialized fold of a leading prefix of `log.bin`, cached at rest.
+///
+/// Sealed under the KEK (never leaves the machine, so a single local key is fine)
+/// with the vault id as AAD. `covered` counts the leading log frames already
+/// folded into `records`; an open replays only the frames past it. `shares` pins
+/// the key material held when the snapshot was built as `(share_id, epoch_count)`
+/// pairs: gaining a share — or absorbing a rotated epoch for one already held —
+/// can make a previously-unopenable frame *inside* the covered prefix decryptable
+/// (a retained foreign/future-epoch frame from a pull), so any change to this set
+/// invalidates the snapshot and forces a full replay.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    covered: u64,
+    shares: Vec<([u8; 16], u32)>,
+    /// One entry per record id — live records AND surviving tombstones. Tombstones
+    /// are retained (never GC'd in v1): dropping one could resurrect a deleted
+    /// record on a peer that hasn't seen the deletion. A future GC could drop a
+    /// tombstone only once every device's sync cursor is known to be past it.
+    records: Vec<Record>,
+}
 
 /// A raw log frame: 16-byte entry id + its sealed blob.
 pub type RawEntry = ([u8; 16], Vec<u8>);
@@ -690,22 +718,149 @@ impl Vault {
 
     /// Decrypt and fold the whole log into state. Entries this device can't open
     /// (a share it isn't a member of) are skipped, not fatal.
-    /// ponytail: full replay on open; add snapshot/compaction past ~10k entries
+    ///
+    /// Past ~[`COMPACT_THRESHOLD`] frames a full decrypt-every-entry replay gets
+    /// slow, so the fold is seeded from a local [`Snapshot`] cache when one is
+    /// valid: only the frames it doesn't already cover are decrypted. The snapshot
+    /// is a pure read optimization derived from `log.bin` — it is never pushed, so
+    /// sync sees the raw log unchanged (see [`Vault::compact`]).
     fn replay_log(&mut self) -> Result<(), VaultError> {
-        let frames = {
+        let (frames_len, covered) = {
             let _lock = self.lock(false)?;
             let mut data = Vec::new();
             fs::File::open(self.dir.join(LOG))?.read_to_end(&mut data)?;
-            parse_frames(&data)?
+            let frames = parse_frames(&data)?;
+            let snapshot = self.read_snapshot()?;
+            let (state, covered) = self.fold_from_snapshot(&frames, snapshot)?;
+            self.state = state;
+            (frames.len(), covered)
         };
+        // Auto-compact once the tail not yet folded into a snapshot grows past the
+        // threshold, and only when it would actually shrink the fold (more frames
+        // than distinct record ids). `compact` takes the exclusive lock, so it must
+        // run after the shared read lock above has been released to avoid a
+        // same-process shared→exclusive upgrade deadlock.
+        if frames_len.saturating_sub(covered) > COMPACT_THRESHOLD && frames_len > self.state.len() {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Seed the merge fold from a valid snapshot and replay only the frames past
+    /// the prefix it covers; returns `(state, frames_covered_by_snapshot)`. A
+    /// snapshot is used only when it covers a prefix of the *current* log (append-
+    /// only, so a leading prefix never changes) and was built with exactly the
+    /// key material this device holds now (`(share_id, epoch_count)` set) — gaining
+    /// a share or absorbing a rotated epoch can make a previously-skipped covered
+    /// frame decryptable, which a stale snapshot would silently miss. Otherwise the
+    /// fold starts empty (full replay).
+    fn fold_from_snapshot(
+        &self,
+        frames: &[RawEntry],
+        snapshot: Option<Snapshot>,
+    ) -> Result<(HashMap<Uuid, Record>, usize), VaultError> {
+        let held = self.held_share_epochs();
+        let (mut state, start) = match snapshot {
+            Some(s) if s.covered as usize <= frames.len() && same_epoch_set(&s.shares, &held) => {
+                let map = s.records.into_iter().map(|r| (r.id, r)).collect();
+                (map, s.covered as usize)
+            }
+            _ => (HashMap::new(), 0),
+        };
+        for (id, blob) in &frames[start..] {
+            if let Some(rec) = self.open_entry(id, blob)? {
+                state
+                    .entry(rec.id)
+                    .and_modify(|cur| *cur = merge::merge(cur, &rec))
+                    .or_insert(rec);
+            }
+        }
+        Ok((state, start))
+    }
+
+    /// Rebuild the [`Snapshot`] cache: fold the whole log into current state (one
+    /// merged record per id — live records AND surviving tombstones) and write it
+    /// sealed to disk, so subsequent opens fold `snapshot + tail` instead of
+    /// decrypting every frame. Returns `true` if a snapshot was written.
+    ///
+    /// This is a LOCAL storage optimization only. It does NOT touch `log.bin`: the
+    /// append-only log, its `entry_id`s, and the sync push/pull cursors are all
+    /// left byte-identical, so compaction cannot perturb convergence. (Rewriting
+    /// the log into fewer entries would mint fresh `entry_id`s that push would ship
+    /// to the relay on every compaction — unbounded relay growth and redundant
+    /// peer pulls — which is why the snapshot is a sidecar, not a log rewrite.)
+    ///
+    /// Tombstones are preserved, never garbage-collected: a tombstone that another
+    /// device hasn't yet observed must survive so its deletion still wins there. A
+    /// future GC could drop a tombstone only once every peer's cursor is provably
+    /// past it.
+    ///
+    /// Idempotent and crash-safe: the snapshot is written to a temp file, fsync'd,
+    /// and atomically renamed; a crash mid-write leaves the old snapshot (or none)
+    /// and the intact log, so the next open still folds correctly.
+    pub fn compact(&mut self) -> Result<bool, VaultError> {
+        let _lock = self.lock(true)?;
+        let mut data = Vec::new();
+        fs::File::open(self.dir.join(LOG))?.read_to_end(&mut data)?;
+        let frames = parse_frames(&data)?;
         let mut records = Vec::with_capacity(frames.len());
         for (id, blob) in &frames {
             if let Some(rec) = self.open_entry(id, blob)? {
                 records.push(rec);
             }
         }
-        self.state = merge::merge_all(&records);
-        Ok(())
+        let state = merge::merge_all(&records);
+        // Only worth a snapshot when the fold actually collapses frames (edits and
+        // tombstones re-writing the same ids); otherwise it would just duplicate
+        // the log on disk with no read win.
+        if frames.len() <= state.len() {
+            self.state = state;
+            return Ok(false);
+        }
+        let snapshot = Snapshot {
+            covered: frames.len() as u64,
+            shares: self.held_share_epochs(),
+            records: state.values().cloned().collect(),
+        };
+        self.write_snapshot(&snapshot)?;
+        self.state = state;
+        Ok(true)
+    }
+
+    /// Read and decrypt the snapshot cache, if present. A snapshot that is missing,
+    /// undecryptable, or unparseable is a cache miss (`Ok(None)`), not an error:
+    /// the caller falls back to a full log replay.
+    fn read_snapshot(&self) -> Result<Option<Snapshot>, VaultError> {
+        let sealed = match fs::read(self.dir.join(SNAPSHOT)) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let Ok(plain) = crypto::open(&self.kek, &sealed, self.meta.vault_id.as_bytes()) else {
+            return Ok(None);
+        };
+        Ok(rmp_serde::from_slice(&plain).ok())
+    }
+
+    /// Seal the snapshot under the KEK (it never leaves the machine) and write it
+    /// atomically.
+    fn write_snapshot(&self, snap: &Snapshot) -> Result<(), VaultError> {
+        let plain = Zeroizing::new(
+            rmp_serde::to_vec_named(snap).map_err(|e| VaultError::Corrupt(e.to_string()))?,
+        );
+        let sealed = crypto::seal(&self.kek, &plain, self.meta.vault_id.as_bytes());
+        atomic_write(&self.dir.join(SNAPSHOT), &sealed)
+    }
+
+    /// The key material this device holds, as `(share_id, epoch_count)` pairs — the
+    /// fingerprint a [`Snapshot`] pins so absorbing a new share or a rotated epoch
+    /// invalidates it (both can newly decrypt a covered frame).
+    fn held_share_epochs(&self) -> Vec<([u8; 16], u32)> {
+        self.keyring
+            .shares
+            .iter()
+            .map(|s| (s.id, s.keys.len() as u32))
+            .collect()
     }
 
     /// Decrypt one log entry by trying every key this device holds — each share,
@@ -1001,6 +1156,12 @@ fn validate_payload<T: Serialize>(kind: Kind, payload: &T) -> Result<(), VaultEr
     Ok(())
 }
 
+/// Order-insensitive equality of two `(share_id, epoch_count)` sets. Share ids are
+/// unique within a keyring, so equal length + subset is set equality.
+fn same_epoch_set(a: &[([u8; 16], u32)], b: &[([u8; 16], u32)]) -> bool {
+    a.len() == b.len() && a.iter().all(|pair| b.contains(pair))
+}
+
 /// Split raw log bytes into `(entry_id, sealed_blob)` frames without decrypting.
 fn parse_frames(data: &[u8]) -> Result<Vec<RawEntry>, VaultError> {
     let mut out = Vec::new();
@@ -1283,5 +1444,209 @@ mod tests {
         b.set_sync_cursor(5).unwrap();
         let disk = Vault::open(tmp.path(), "pw").unwrap();
         assert_eq!(disk.meta.sync_cursor, 10, "cursor only advances");
+    }
+
+    // ---- compaction / snapshots -------------------------------------------
+
+    /// Exercise every mutation path across several record ids so the log has many
+    /// more frames than surviving records — adds, repeated edits, and deletes.
+    /// Returns the alias set that should remain live after all of it.
+    fn churn_vault(v: &mut Vault) -> Vec<String> {
+        // 12 hosts, edited a few times each, then delete every third.
+        for i in 0..12 {
+            let a = format!("h{i}");
+            v.add(Kind::Host, "alias", &a, &host(&a)).unwrap();
+        }
+        for round in 0..3 {
+            for i in 0..12 {
+                let a = format!("h{i}");
+                let mut h = host(&a);
+                h.port = Some(2000 + round * 100 + i as u16);
+                h.user = Some(format!("u{round}"));
+                v.edit(Kind::Host, "alias", &a, &h).unwrap();
+            }
+        }
+        // Add a couple of other kinds so tombstones aren't the only variety.
+        v.add(
+            Kind::Snippet,
+            "name",
+            "logs",
+            &Snippet {
+                name: "logs".into(),
+                command: "tail -f x".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut live = Vec::new();
+        for i in 0..12 {
+            let a = format!("h{i}");
+            if i % 3 == 0 {
+                v.remove(Kind::Host, "alias", &a).unwrap();
+            } else {
+                live.push(a);
+            }
+        }
+        live.sort();
+        live
+    }
+
+    #[test]
+    fn compact_preserves_materialized_state_exactly() {
+        let (tmp, mut v) = test_vault();
+        churn_vault(&mut v);
+        // The full-replay fold, captured before compaction.
+        let before = v.state.clone();
+        // Sanity: the log really is bigger than the surviving record set, so
+        // compaction has something to collapse.
+        let frames = v.raw_entries().unwrap().len();
+        assert!(
+            frames > before.len(),
+            "test churn must produce a collapsible log ({frames} frames > {} records)",
+            before.len()
+        );
+
+        assert!(
+            v.compact().unwrap(),
+            "compaction should shrink and snapshot"
+        );
+        assert!(
+            tmp.path().join(SNAPSHOT).exists(),
+            "compact writes the snapshot sidecar"
+        );
+        // In-memory state after compact is unchanged...
+        assert_eq!(v.state, before, "compact must not alter materialized state");
+        drop(v);
+
+        // ...and a reopen that folds snapshot + tail is byte-identical to a full
+        // replay of the original log.
+        let reopened = Vault::open(tmp.path(), "pw").unwrap();
+        assert_eq!(
+            reopened.state, before,
+            "snapshot-seeded replay must equal full replay"
+        );
+    }
+
+    #[test]
+    fn compaction_leaves_the_sync_log_untouched() {
+        // Compaction is a LOCAL optimization: the append-only log, its entry_ids,
+        // and therefore everything sync pushes/pulls must be byte-identical after
+        // it. Only the snapshot sidecar appears.
+        let (tmp, mut v) = test_vault();
+        churn_vault(&mut v);
+        let raw_before = v.raw_entries().unwrap();
+        let log_bytes_before = fs::read(tmp.path().join(LOG)).unwrap();
+
+        v.compact().unwrap();
+
+        let raw_after = v.raw_entries().unwrap();
+        let log_bytes_after = fs::read(tmp.path().join(LOG)).unwrap();
+        assert_eq!(raw_before, raw_after, "entry_ids/blobs must not change");
+        assert_eq!(
+            log_bytes_before, log_bytes_after,
+            "log.bin must be byte-identical after compaction"
+        );
+    }
+
+    #[test]
+    fn compacted_vault_does_not_resurrect_a_deleted_record() {
+        let (tmp, mut v) = test_vault();
+        v.add(Kind::Host, "alias", "gone", &host("gone")).unwrap();
+        v.add(Kind::Host, "alias", "keep", &host("keep")).unwrap();
+        v.remove(Kind::Host, "alias", "gone").unwrap();
+        let id = v
+            .state
+            .values()
+            .find(|r| r.fields.get("alias").map(|f| f.value == "gone") == Some(true))
+            .map(|r| r.id);
+
+        v.compact().unwrap();
+        drop(v);
+
+        let v = Vault::open(tmp.path(), "pw").unwrap();
+        assert!(
+            v.find(Kind::Host, "alias", "gone").is_none(),
+            "deleted record must stay deleted after compaction"
+        );
+        assert!(
+            v.list::<Host>(Kind::Host)
+                .iter()
+                .all(|(_, h)| h.alias != "gone"),
+            "deleted record must not reappear in listings"
+        );
+        // The tombstone itself must survive in state so a peer that hasn't seen
+        // the deletion still converges to deleted — not silently GC'd.
+        if let Some(id) = id {
+            let rec = v.state.get(&id).expect("tombstone retained in state");
+            assert!(rec.is_deleted(), "retained record is still a tombstone");
+        }
+    }
+
+    #[test]
+    fn fold_of_log_equals_fold_of_compacted() {
+        // The property the whole design rests on: compaction is fold-preserving.
+        // fold(log) == fold(snapshot ++ nothing) == fold after reopen.
+        let (tmp, mut v) = test_vault();
+        churn_vault(&mut v);
+        let full = v.state.clone();
+        v.compact().unwrap();
+        // Append more mutations *after* the snapshot so reopen folds snapshot+tail.
+        v.add(Kind::Host, "alias", "late", &host("late")).unwrap();
+        v.edit(Kind::Host, "alias", "late", &{
+            let mut h = host("late");
+            h.port = Some(999);
+            h
+        })
+        .unwrap();
+        let expected = v.state.clone();
+        assert_ne!(full, expected, "post-snapshot appends changed state");
+        drop(v);
+
+        let reopened = Vault::open(tmp.path(), "pw").unwrap();
+        assert_eq!(
+            reopened.state, expected,
+            "snapshot + tail fold must equal a full replay of the whole log"
+        );
+    }
+
+    #[test]
+    fn snapshot_is_ignored_when_stale_or_corrupt() {
+        // A snapshot that fails to decrypt or parse must be a silent cache miss:
+        // the open falls back to a full replay and still produces correct state.
+        let (tmp, mut v) = test_vault();
+        let live = churn_vault(&mut v);
+        v.compact().unwrap();
+        let good = v.state.clone();
+        drop(v);
+
+        // Corrupt the snapshot sidecar; the log is still intact.
+        fs::write(tmp.path().join(SNAPSHOT), b"not a valid sealed snapshot").unwrap();
+        let v = Vault::open(tmp.path(), "pw").unwrap();
+        assert_eq!(v.state, good, "corrupt snapshot falls back to full replay");
+        let mut got: Vec<String> = v
+            .list::<Host>(Kind::Host)
+            .into_iter()
+            .map(|(_, h)| h.alias)
+            .collect();
+        got.sort();
+        assert_eq!(got, live, "full-replay listing matches expected live set");
+    }
+
+    #[test]
+    fn compact_is_a_noop_without_collapse() {
+        // Distinct ids only, no edits/deletes: frames == records, nothing to gain.
+        let (tmp, mut v) = test_vault();
+        for i in 0..5 {
+            let a = format!("h{i}");
+            v.add(Kind::Host, "alias", &a, &host(&a)).unwrap();
+        }
+        assert!(
+            !v.compact().unwrap(),
+            "no collapse possible → no snapshot written"
+        );
+        assert!(
+            !tmp.path().join(SNAPSHOT).exists(),
+            "a no-op compaction leaves no sidecar"
+        );
     }
 }
