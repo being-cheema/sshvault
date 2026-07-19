@@ -66,12 +66,13 @@ mobile, so sync is foreground-only. `apply` is meaningless on a phone; not porte
 - **Seen-signature cache. — DONE** (shipped with rotation, which needs it).
   Persisted `seen_sigs` table gates the non-idempotent `/v1/rotate`; team-vault
   mutations will reuse it.
-- **Log compaction / snapshots.** `vault.rs:428`: "ponytail: full replay on open;
-  add snapshot/compaction past ~10k entries" (echoed in `architecture.md`).
-  Design: periodically write the merged state as a snapshot entry set, truncate
-  the log behind it. Hard part: proving the snapshot fold is byte-equivalent to
-  the full replay (extend the existing merge proptests) and never dropping a
-  tombstone another device still needs.
+- **Log compaction / snapshots. — DONE.** `Vault::compact()` folds the log into a
+  per-record snapshot (live records + surviving tombstones) sealed under the KEK in
+  a `snapshot.bin` sidecar; opens fold `snapshot + uncovered tail`, auto-compacting
+  past ~10k frames. The log, its `entry_id`s, and sync cursors are byte-identical
+  after compaction (a sidecar, not a log rewrite — rewriting would mint fresh
+  entry_ids that push ships to the relay every time). Tombstones are never GC'd.
+  See `Vault::compact` and the 6 invariant tests in `vault.rs`.
 - **WS push for enrollment approval.** `device.rs:71`: "ponytail: fixed 2s poll;
   WS push is a v0.2 nicety." The enrolling device should learn of approval over
   the existing `/v1/ws` channel instead of polling `/v1/wrapped` every 2 s.
