@@ -1121,6 +1121,14 @@ fn derive_kek(meta: &Meta, passphrase: &str) -> Result<Secret32, VaultError> {
 /// Reject anything that smells like private key material (non-negotiable v0.1
 /// invariant: private keys never enter the vault). Checks every string field.
 fn validate_payload<T: Serialize>(kind: Kind, payload: &T) -> Result<(), VaultError> {
+    // The single, deliberate carve-out: PrivateKey records are the one kind
+    // allowed to carry PEM key material (which legitimately contains both the
+    // "PRIVATE KEY" marker and newlines). This bypass is scoped strictly to
+    // Kind::PrivateKey — every other kind still gets both guards below. Such a
+    // record never reaches ssh_config, so the injection guards don't apply.
+    if kind == Kind::PrivateKey {
+        return Ok(());
+    }
     let value = serde_json::to_value(payload).expect("payloads are plain structs");
     let mut stack = vec![&value];
     while let Some(v) = stack.pop() {
@@ -1201,6 +1209,7 @@ fn kind_str(kind: Kind) -> &'static str {
         Kind::Snippet => "snippet",
         Kind::PortForward => "port-forward",
         Kind::KeyMeta => "key",
+        Kind::PrivateKey => "private-key",
         Kind::ShareName => "share",
         Kind::Tombstone => "record",
     }
@@ -1248,7 +1257,7 @@ fn restrict_permissions(path: &Path) -> Result<(), VaultError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{Host, KeyMeta, Snippet};
+    use crate::record::{Host, KeyMeta, PrivateKey, Snippet};
     use tempfile::TempDir;
 
     fn test_vault() -> (TempDir, Vault) {
@@ -1350,6 +1359,72 @@ mod tests {
         };
         assert!(matches!(
             v.add(Kind::KeyMeta, "name", "oops", &bad),
+            Err(VaultError::PrivateKeyMaterial(_))
+        ));
+    }
+
+    #[test]
+    fn private_key_record_round_trips() {
+        let pem =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\ndef\n-----END OPENSSH PRIVATE KEY-----\n";
+        let (tmp, mut v) = test_vault();
+        v.add(
+            Kind::PrivateKey,
+            "name",
+            "id_ed25519",
+            &PrivateKey {
+                name: "id_ed25519".into(),
+                key_pem: pem.into(),
+                public_key: Some("ssh-ed25519 AAAA... user@host".into()),
+            },
+        )
+        .unwrap();
+        drop(v);
+
+        // Reopen the vault from disk and confirm the key survives intact.
+        let v = Vault::open(tmp.path(), "pw").unwrap();
+        let keys = v.list::<PrivateKey>(Kind::PrivateKey);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].1.name, "id_ed25519");
+        assert_eq!(keys[0].1.key_pem, pem);
+        assert_eq!(
+            keys[0].1.public_key.as_deref(),
+            Some("ssh-ed25519 AAAA... user@host")
+        );
+    }
+
+    #[test]
+    fn private_key_carveout_does_not_leak_to_other_kinds() {
+        // The Kind::PrivateKey bypass must NOT relax the guard for any other
+        // kind: a Host/Snippet/KeyMeta field containing "PRIVATE KEY" is still
+        // rejected. This is the regression that proves the carve-out is narrow.
+        let (_tmp, mut v) = test_vault();
+        let marker = "-----BEGIN OPENSSH PRIVATE KEY-----";
+
+        let mut h = host("web");
+        h.hostname = Some(marker.into());
+        assert!(matches!(
+            v.add(Kind::Host, "alias", "web", &h),
+            Err(VaultError::PrivateKeyMaterial(_))
+        ));
+
+        let snip = Snippet {
+            name: "s".into(),
+            command: marker.into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            v.add(Kind::Snippet, "name", "s", &snip),
+            Err(VaultError::PrivateKeyMaterial(_))
+        ));
+
+        let km = KeyMeta {
+            name: "k".into(),
+            public_key: marker.into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            v.add(Kind::KeyMeta, "name", "k", &km),
             Err(VaultError::PrivateKeyMaterial(_))
         ));
     }

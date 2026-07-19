@@ -23,6 +23,11 @@ pub enum Kind {
     Snippet,
     PortForward,
     KeyMeta,
+    /// Private key material. The ONE kind permitted to carry a `PRIVATE KEY`
+    /// blob into the vault (opt-in only; see `vault::validate_payload`). Still
+    /// sealed under the share/vault key like every record, so the relay never
+    /// sees plaintext. Never rendered to ssh_config.
+    PrivateKey,
     /// Maps a share's human name to its id, so every default-share member can
     /// address a share by name. Names aren't secret (membership is), so this
     /// lives in the default share. Never rendered to ssh_config.
@@ -156,6 +161,18 @@ pub struct KeyMeta {
     /// Host aliases that use this key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
+}
+
+/// Private key material — the one payload allowed to carry a PEM `PRIVATE KEY`
+/// blob. Stored only via the explicit `key add-private` command and sealed like
+/// any record. No `Debug` derive on `key_pem` is a concern only if logged; we
+/// never log this struct. `public_key` is the optional matching `.pub`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PrivateKey {
+    pub name: String,
+    pub key_pem: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 /// Maps a share's human name to its 16-byte id (base64). Lives in the default

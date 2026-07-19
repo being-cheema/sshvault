@@ -4,10 +4,12 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
-use sshvault::record::{ForwardKind, Host, KeyMeta, Kind, PortForward, Snippet};
+use sshvault::record::{ForwardKind, Host, KeyMeta, Kind, PortForward, PrivateKey, Snippet};
 use sshvault::sshconfig;
 use sshvault::vault::{self, Vault};
+use std::io::Write as _;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "sshvault", version, about = "End-to-end-encrypted sync for your SSH workflow", long_about = None)]
@@ -262,8 +264,29 @@ enum KeyCmd {
     },
     /// Remove key metadata
     Rm { name: String },
-    /// List key metadata
+    /// List key metadata (and any synced private keys, marked `[private]`)
     List,
+    /// Store a PRIVATE key in the vault (opt-in; sealed E2E like every record).
+    /// A deliberate, separate command from `add` so this is never accidental.
+    AddPrivate {
+        name: String,
+        /// Path to the PRIVATE key file (e.g. ~/.ssh/id_ed25519)
+        #[arg(long = "private")]
+        private: PathBuf,
+        /// Optional matching PUBLIC key file (e.g. ~/.ssh/id_ed25519.pub)
+        #[arg(long = "public")]
+        public: Option<PathBuf>,
+    },
+    /// Materialize a synced private key to disk (default ~/.ssh/<name>, mode 0600)
+    Install {
+        name: String,
+        /// Destination path (default ~/.ssh/<name>)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Overwrite an existing file at the destination
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -575,6 +598,163 @@ fn key_cmd(cmd: KeyCmd) -> Result<()> {
                 };
                 println!("{}  {fp}{hosts}", k.name);
             }
+            // Private keys, distinctly marked. NEVER print any key bytes.
+            let mut priv_keys = v.list::<PrivateKey>(Kind::PrivateKey);
+            priv_keys.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+            for (_, k) in priv_keys {
+                let pub_note = if k.public_key.is_some() {
+                    "  (public key stored)"
+                } else {
+                    ""
+                };
+                println!("{}  [private]{pub_note}", k.name);
+            }
+        }
+        KeyCmd::AddPrivate {
+            name,
+            private,
+            public,
+        } => {
+            safe_key_name(&name)?;
+            // Hold the secret in zeroized memory for its whole lifetime.
+            let key_pem = Zeroizing::new(
+                std::fs::read_to_string(&private)
+                    .with_context(|| format!("cannot read {}", private.display()))?,
+            );
+            if !key_pem.contains("PRIVATE KEY") {
+                bail!(
+                    "{} does not look like a PEM private key (no 'PRIVATE KEY' marker)",
+                    private.display()
+                );
+            }
+            let public_key = match public {
+                Some(p) => Some(read_public_key(&p)?),
+                None => None,
+            };
+            let payload = PrivateKey {
+                name: name.clone(),
+                key_pem: key_pem.to_string(),
+                public_key,
+            };
+            v.add(Kind::PrivateKey, "name", &name, &payload)?;
+            println!("stored private key '{name}' (sealed, end-to-end encrypted)");
+        }
+        KeyCmd::Install { name, out, force } => {
+            let rec = v
+                .find(Kind::PrivateKey, "name", &name)
+                .with_context(|| format!("private key '{name}' not found"))?;
+            let payload: PrivateKey = rec.payload()?;
+            let pem = Zeroizing::new(payload.key_pem);
+            let out = match out {
+                // An explicit --out is the user's own typed choice.
+                Some(p) => p,
+                // The default path is derived from the record's name, which may
+                // have arrived over sync unvalidated — constrain it to a plain
+                // filename under ~/.ssh so it can't escape to an arbitrary path.
+                None => {
+                    let safe = safe_key_name(&payload.name).with_context(|| {
+                        format!(
+                            "refusing to install private key with unsafe name {:?}",
+                            payload.name
+                        )
+                    })?;
+                    dirs::home_dir()
+                        .context("cannot determine home directory")?
+                        .join(".ssh")
+                        .join(safe)
+                }
+            };
+            write_private_key(&out, &pem, force)?;
+            println!(
+                "installed private key '{name}' to {} (mode 0600)",
+                out.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reject a key name that could escape `~/.ssh/<name>` when used to build the
+/// install path. This is the real security boundary: a `PrivateKey` record can
+/// arrive over sync (`apply_remote_entry` does NOT run `validate_payload`), so a
+/// malicious co-member could ship `name = "config"`, an absolute path, or one
+/// with `..` to overwrite an arbitrary file with attacker-controlled contents
+/// (→ ssh `ProxyCommand` RCE). We refuse any name that is not a single, plain
+/// filename component.
+fn safe_key_name(name: &str) -> Result<&str> {
+    let ok = !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && std::path::Path::new(name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            == Some(name);
+    if !ok {
+        bail!("invalid key name {name:?}: must be a plain filename (no '/', '\\', '..', or leading '.')");
+    }
+    Ok(name)
+}
+
+/// Write private-key PEM to `out`, creating the file with mode 0600 AT CREATION
+/// (never a world-readable window). Deliberately does NOT reuse `atomic_write`,
+/// whose `File::create` opens at the umask default (typically 0644) and only
+/// chmods to 0600 afterward — that leak window is unacceptable for plaintext key
+/// material. `create_new(true)` sets O_EXCL so an existing file is an error;
+/// `--force` removes the old file first, then still creates 0600 via O_EXCL
+/// (never a plain truncating open that could momentarily widen perms).
+fn write_private_key(out: &std::path::Path, pem: &Zeroizing<String>, force: bool) -> Result<()> {
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+        // A newly created ~/.ssh at umask default is often 0755; tighten any dir
+        // we just made to 0700 so the key's parent isn't world-traversable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    if force && out.exists() {
+        std::fs::remove_file(out).with_context(|| format!("cannot replace {}", out.display()))?;
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true); // O_CREAT|O_EXCL: refuse if it already exists
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600); // perms fixed at creation, before any bytes are written
+    }
+    // On non-unix we still get O_EXCL create; file perms are best-effort only
+    // (Windows ACLs are out of scope — see module note).
+    let mut f = opts.open(out).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "{} already exists (use --force to overwrite)",
+                out.display()
+            )
+        } else {
+            // Never leak key bytes into an error; only the path/os error.
+            anyhow::Error::new(e).context(format!("cannot create {}", out.display()))
+        }
+    })?;
+    f.write_all(pem.as_bytes())
+        .with_context(|| format!("cannot write {}", out.display()))?;
+    f.sync_all()
+        .with_context(|| format!("cannot flush {}", out.display()))?;
+
+    // Defense in depth: verify the on-disk perms are exactly 0600.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(out)?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            bail!(
+                "{} has unexpected mode {:o} (expected 600)",
+                out.display(),
+                mode
+            );
         }
     }
     Ok(())
@@ -1002,7 +1182,6 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::ssh_fingerprint;
-
     /// A well-formed OpenSSH ed25519 public-key line (51-byte wire blob).
     const PUBKEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDCypbnDnL/FGaVRCiLo6/QO2ueMrRKGBUhexVRJ/3HX test@host";
 
@@ -1057,5 +1236,87 @@ mod tests {
         // No base64 second field → None, but the caller still stores public_key.
         assert_eq!(ssh_fingerprint("not-a-key"), None);
         assert_eq!(ssh_fingerprint(""), None);
+    }
+
+    // ---- private-key materialization safety ------------------------------
+
+    #[cfg(unix)]
+    mod materialize {
+        use super::super::write_private_key;
+        use std::os::unix::fs::PermissionsExt;
+        use zeroize::Zeroizing;
+
+        const PEM: &str =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n-----END OPENSSH PRIVATE KEY-----\n";
+
+        fn mode(p: &std::path::Path) -> u32 {
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        fn safe_key_name_blocks_path_escapes() {
+            use super::super::safe_key_name;
+            // plain filenames are allowed
+            assert!(safe_key_name("id_ed25519").is_ok());
+            assert!(safe_key_name("work-key").is_ok());
+            // the exploit vectors from adversarial review must all be refused:
+            // traversal, absolute paths, path separators, and dotfiles.
+            for bad in [
+                "",
+                ".",
+                "..",
+                "../evil",
+                "../../.bashrc",
+                "/etc/passwd",
+                "/home/victim/.bashrc",
+                "a/b",
+                "a\\b",
+                ".hidden",
+            ] {
+                assert!(
+                    safe_key_name(bad).is_err(),
+                    "expected {bad:?} to be rejected as an unsafe key name"
+                );
+            }
+        }
+
+        #[test]
+        fn materialized_file_is_0600() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("id_ed25519");
+            write_private_key(&out, &Zeroizing::new(PEM.to_string()), false).unwrap();
+            assert_eq!(mode(&out), 0o600);
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), PEM);
+        }
+
+        #[test]
+        fn install_without_force_refuses_existing_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("id_ed25519");
+            std::fs::write(&out, "pre-existing").unwrap();
+            let err = write_private_key(&out, &Zeroizing::new(PEM.to_string()), false).unwrap_err();
+            assert!(
+                err.to_string().contains("already exists"),
+                "expected refusal, got: {err}"
+            );
+            // The original file must be untouched.
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "pre-existing");
+        }
+
+        #[test]
+        fn install_with_force_replaces_and_stays_0600() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("id_ed25519");
+            // Pre-existing world-readable file.
+            std::fs::write(&out, "old").unwrap();
+            std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644)).unwrap();
+            write_private_key(&out, &Zeroizing::new(PEM.to_string()), true).unwrap();
+            assert_eq!(
+                mode(&out),
+                0o600,
+                "replaced file must be 0600, not the old 0644"
+            );
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), PEM);
+        }
     }
 }
